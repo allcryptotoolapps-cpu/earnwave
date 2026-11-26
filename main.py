@@ -117,6 +117,26 @@ async def admin_panel(message: Message):
         "More management features will be added next."
     )
 
+@dp.message(Command("users"))
+async def admin_users(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    async with db_pool.acquire() as conn:
+        users = await conn.fetch(
+            "SELECT user_id, points FROM users ORDER BY points DESC LIMIT 20"
+        )
+
+    if not users:
+        await message.answer("No users found.")
+        return
+
+    text = "👥 USER LIST\n\n"
+    for user in users:
+        text += f"ID: {user['user_id']} | Points: {user['points']}\n"
+
+    await message.answer(text)
+
 
 @dp.message(lambda msg: msg.text == "🎬 Watch Ads")
 async def watch_ads(message: Message):
