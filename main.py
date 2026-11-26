@@ -1,5 +1,6 @@
 import asyncio
 import os
+import time
 from aiohttp import web
 
 from aiogram import Bot, Dispatcher
@@ -8,6 +9,7 @@ from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 
 TOKEN = os.getenv("BOT_TOKEN")
 PORT = int(os.getenv("PORT", "10000"))
+COOLDOWN_SECONDS = 30
 
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN is missing")
@@ -15,8 +17,8 @@ if not TOKEN:
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# ইউজারের পয়েন্ট রাখার সহজ ডিকশনারি (পরীক্ষার জন্য)
 user_points: dict[int, int] = {}
+last_ad_time: dict[int, float] = {}
 
 keyboard = ReplyKeyboardMarkup(
     keyboard=[
@@ -42,6 +44,16 @@ async def start(message: Message):
 @dp.message(lambda msg: msg.text == "🎬 Watch Ads")
 async def watch_ads(message: Message):
     user_id = message.from_user.id
+    now = time.monotonic()
+    last_time = last_ad_time.get(user_id, 0.0)
+    elapsed = now - last_time
+
+    if elapsed < COOLDOWN_SECONDS:
+        remaining = int(COOLDOWN_SECONDS - elapsed) + 1
+        await message.answer(f"⏳ Please wait {remaining}s before watching another ad.")
+        return
+
+    last_ad_time[user_id] = now
     current = user_points.get(user_id, 0) + 10
     user_points[user_id] = current
     await message.answer(
@@ -70,11 +82,18 @@ async def tasks(message: Message):
 async def withdraw(message: Message):
     user_id = message.from_user.id
     current = user_points.get(user_id, 0)
-    await message.answer(
-        f"💳 Withdraw Info:\n"
-        f"• Current balance: {current} points\n"
-        f"• Minimum required: 100 points"
-    )
+    if current < 100:
+        await message.answer(
+            f"💳 Withdraw Info:\n"
+            f"• Current balance: {current} points\n"
+            f"• Minimum required: 100 points"
+        )
+    else:
+        await message.answer(
+            f"✅ You are eligible to withdraw!\n"
+            f"💰 Current balance: {current} points\n"
+            f"Please contact admin to process your request."
+        )
 
 
 @dp.message()
