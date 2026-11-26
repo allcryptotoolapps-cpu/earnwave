@@ -589,46 +589,108 @@ async def reject_submission(message: Message):
 
 # ---------------- USER WITHDRAWALS ----------------
 
+
 @dp.message(Command("withdraw"))
 async def create_withdrawal(message: Message):
     if not await allowed(message):
         return
+
     try:
-        _, amount_text, wallet = message.text.split(maxsplit=2)
+        _, amount_text, network, wallet = message.text.split(maxsplit=3)
         amount = int(amount_text)
+        network = network.upper().strip()
+        wallet = wallet.strip()
+
+        if network not in ("TRC20", "BEP20"):
+            await message.answer("Network must be TRC20 or BEP20.")
+            return
+
         uid = message.from_user.id
         minimum = await get_setting("min_withdraw", MIN_WITHDRAWAL)
+
         if amount < minimum or amount <= 0:
-            await message.answer(f"Minimum withdrawal is {minimum} points.")
+            await message.answer(
+                f"Minimum withdrawal is {minimum} points ($5 USDT)."
+            )
             return
+
         async with db_pool.acquire() as conn:
             async with conn.transaction():
-                user = await conn.fetchrow("SELECT points FROM users WHERE user_id = $1 FOR UPDATE", uid)
+                user = await conn.fetchrow(
+                    "SELECT points FROM users WHERE user_id = $1 FOR UPDATE",
+                    uid
+                )
+
                 if not user or user["points"] < amount:
                     await message.answer("Insufficient points.")
                     return
-                await conn.execute("UPDATE users SET points = points - $1 WHERE user_id = $2", amount, uid)
+
+                await conn.execute(
+                    "UPDATE users SET points = points - $1 WHERE user_id = $2",
+                    amount, uid
+                )
+
                 wid = await conn.fetchval("""
-                    INSERT INTO withdrawals (user_id, amount, wallet) VALUES ($1, $2, $3) RETURNING withdrawal_id
-                """, uid, amount, wallet)
-        await message.answer(f"✅ Withdrawal request submitted!\nRequest ID: {wid}\nAmount: {amount} points\nPoints reserved pending review.")
+                    INSERT INTO withdrawals (user_id, amount, wallet)
+                    VALUES ($1, $2, $3)
+                    RETURNING withdrawal_id
+                """, uid, amount, f"{network}|{wallet}")
+
+        await message.answer(
+            f"✅ Withdrawal request submitted!\n"
+            f"Request ID: {wid}\n"
+            f"Amount: {amount} points (${amount / 1000:.2f} USDT)\n"
+            f"Network: {network}\n"
+            f"Points reserved pending review."
+        )
+
     except (ValueError, IndexError):
-        await message.answer("Use: /withdraw AMOUNT YOUR_CRYPTO_WALLET")
+        await message.answer(
+            "Use:\n/withdraw AMOUNT TRC20 YOUR_WALLET\n"
+            "or\n/withdraw AMOUNT BEP20 YOUR_WALLET"
+        )
+
+
 
 
 @dp.message(Command("withdrawals"))
 async def pending_withdrawals(message: Message):
     if not await is_admin(message.from_user.id):
         return
+
     async with db_pool.acquire() as conn:
-        rows = await conn.fetch("SELECT withdrawal_id, user_id, amount, wallet FROM withdrawals WHERE status = 'pending' ORDER BY withdrawal_id DESC LIMIT 20")
+        rows = await conn.fetch("""
+            SELECT withdrawal_id, user_id, amount, wallet
+            FROM withdrawals
+            WHERE status = 'pending'
+            ORDER BY withdrawal_id DESC
+            LIMIT 20
+        """)
+
     if not rows:
         await message.answer("No pending withdrawals.")
         return
+
     out = "💳 PENDING WITHDRAWALS\n\n"
+
     for r in rows:
-        out += f"ID: {r['withdrawal_id']}\nUser: {r['user_id']}\nAmount: {r['amount']} points\nWallet: {r['wallet']}\n\n"
+        saved_wallet = r["wallet"]
+        if "|" in saved_wallet:
+            network, wallet = saved_wallet.split("|", 1)
+        else:
+            network, wallet = "OLD REQUEST", saved_wallet
+
+        out += (
+            f"ID: {r['withdrawal_id']}\n"
+            f"User: {r['user_id']}\n"
+            f"Amount: {r['amount']} points "
+            f"(${r['amount'] / 1000:.2f} USDT)\n"
+            f"Network: {network}\n"
+            f"Wallet: {wallet}\n\n"
+        )
+
     await message.answer(out)
+
 
 
 @dp.message(Command("approvewithdraw"))
