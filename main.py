@@ -138,6 +138,34 @@ async def admin_users(message: Message):
     await message.answer(text)
 
 
+@dp.message(Command("addpoints"))
+async def add_points(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    try:
+        _, user_id, amount = message.text.split()
+        user_id = int(user_id)
+        amount = int(amount)
+
+        if amount <= 0:
+            raise ValueError
+
+        async with db_pool.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE users SET points = points + $1 WHERE user_id = $2",
+                amount, user_id
+            )
+
+        if result == "UPDATE 0":
+            await message.answer("User not found.")
+        else:
+            await message.answer(f"✅ Added {amount} points to {user_id}.")
+
+    except:
+        await message.answer("Use: /addpoints USER_ID AMOUNT")
+        
+
 @dp.message(lambda msg: msg.text == "🎬 Watch Ads")
 async def watch_ads(message: Message):
     user_id = message.from_user.id
