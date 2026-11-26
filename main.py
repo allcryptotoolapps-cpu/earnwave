@@ -1,24 +1,40 @@
 import asyncio
 import os
-import time
+import math
+from datetime import datetime, timezone, timedelta
+
+import asyncpg
 from aiohttp import web
 
 from aiogram import Bot, Dispatcher
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 
+
 TOKEN = os.getenv("BOT_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
 PORT = int(os.getenv("PORT", "10000"))
+
 COOLDOWN_SECONDS = 30
+REWARD_POINTS = 10
+
+# Admin Telegram User ID
+ADMIN_IDS = {8435970103}
 
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN is missing")
 
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is missing")
+
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace(
+        "postgres://", "postgresql://", 1
+    )
+
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
-
-user_points: dict[int, int] = {}
-last_ad_time: dict[int, float] = {}
+db_pool = None
 
 keyboard = ReplyKeyboardMarkup(
     keyboard=[
@@ -30,10 +46,46 @@ keyboard = ReplyKeyboardMarkup(
 )
 
 
+async def setup_database():
+    global db_pool
+
+    db_pool = await asyncpg.create_pool(DATABASE_URL)
+
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY,
+                points BIGINT NOT NULL DEFAULT 0,
+                last_ad_at TIMESTAMPTZ
+            )
+        """)
+
+    print("PostgreSQL connected successfully!")
+
+
+async def register_user(user_id: int):
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO users (user_id, points)
+            VALUES ($1, 0)
+            ON CONFLICT (user_id) DO NOTHING
+        """, user_id)
+
+
+async def get_user(user_id: int):
+    async with db_pool.acquire() as conn:
+        return await conn.fetchrow("""
+            SELECT points, last_ad_at
+            FROM users
+            WHERE user_id = $1
+        """, user_id)
+
+
 @dp.message(CommandStart())
 async def start(message: Message):
     user_id = message.from_user.id
-    user_points.setdefault(user_id, 0)
+    await register_user(user_id)
+
     await message.answer(
         "Welcome to EarnWave! 🌟\n\n"
         "Earn points by watching ads and completing tasks.",
@@ -41,32 +93,86 @@ async def start(message: Message):
     )
 
 
+@dp.message(Command("admin"))
+async def admin_panel(message: Message):
+    user_id = message.from_user.id
+
+    if user_id not in ADMIN_IDS:
+        await message.answer("⛔ You are not authorized to access the Admin Panel.")
+        return
+
+    async with db_pool.acquire() as conn:
+        total_users = await conn.fetchval(
+            "SELECT COUNT(*) FROM users"
+        )
+        total_points = await conn.fetchval(
+            "SELECT COALESCE(SUM(points), 0) FROM users"
+        )
+
+    await message.answer(
+        "🛠 EARNWAVE ADMIN PANEL\n\n"
+        f"👥 Total Users: {total_users}\n"
+        f"💰 Total Points: {total_points}\n\n"
+        "Admin access confirmed!\n"
+        "More management features will be added next."
+    )
+
+
 @dp.message(lambda msg: msg.text == "🎬 Watch Ads")
 async def watch_ads(message: Message):
     user_id = message.from_user.id
-    now = time.monotonic()
-    last_time = last_ad_time.get(user_id, 0.0)
-    elapsed = now - last_time
+    await register_user(user_id)
 
-    if elapsed < COOLDOWN_SECONDS:
-        remaining = int(COOLDOWN_SECONDS - elapsed) + 1
-        await message.answer(f"⏳ Please wait {remaining}s before watching another ad.")
-        return
+    async with db_pool.acquire() as conn:
+        result = await conn.fetchrow("""
+            UPDATE users
+            SET points = points + $2,
+                last_ad_at = NOW()
+            WHERE user_id = $1
+            AND (
+                last_ad_at IS NULL
+                OR last_ad_at <= NOW() - INTERVAL '30 seconds'
+            )
+            RETURNING points
+        """, user_id, REWARD_POINTS)
 
-    last_ad_time[user_id] = now
-    current = user_points.get(user_id, 0) + 10
-    user_points[user_id] = current
+        if result:
+            await message.answer(
+                f"🎉 You earned +{REWARD_POINTS} points!\n"
+                f"💰 Your balance: {result['points']} points"
+            )
+            return
+
+        last_ad_at = await conn.fetchval(
+            "SELECT last_ad_at FROM users WHERE user_id = $1",
+            user_id
+        )
+
+    remaining = max(
+        1,
+        math.ceil(
+            (
+                last_ad_at
+                + timedelta(seconds=COOLDOWN_SECONDS)
+                - datetime.now(timezone.utc)
+            ).total_seconds()
+        )
+    )
+
     await message.answer(
-        f"🎉 You earned +10 points!\n"
-        f"💰 Your balance: {current} points"
+        f"⏳ Please wait {remaining}s before watching another ad."
     )
 
 
 @dp.message(lambda msg: msg.text == "💰 Balance")
 async def balance(message: Message):
     user_id = message.from_user.id
-    current = user_points.get(user_id, 0)
-    await message.answer(f"💰 Your current balance: {current} points")
+    await register_user(user_id)
+    user = await get_user(user_id)
+
+    await message.answer(
+        f"💰 Your current balance: {user['points']} points"
+    )
 
 
 @dp.message(lambda msg: msg.text == "📋 Tasks")
@@ -81,7 +187,10 @@ async def tasks(message: Message):
 @dp.message(lambda msg: msg.text == "💳 Withdraw")
 async def withdraw(message: Message):
     user_id = message.from_user.id
-    current = user_points.get(user_id, 0)
+    await register_user(user_id)
+    user = await get_user(user_id)
+    current = user["points"]
+
     if current < 100:
         await message.answer(
             f"💳 Withdraw Info:\n"
@@ -92,13 +201,16 @@ async def withdraw(message: Message):
         await message.answer(
             f"✅ You are eligible to withdraw!\n"
             f"💰 Current balance: {current} points\n"
-            f"Please contact admin to process your request."
+            "Please contact admin to process your request."
         )
 
 
 @dp.message()
 async def fallback(message: Message):
-    await message.answer("Please use the menu buttons below. 👇", reply_markup=keyboard)
+    await message.answer(
+        "Please use the menu buttons below. 👇",
+        reply_markup=keyboard
+    )
 
 
 async def health_handler(request: web.Request):
@@ -112,13 +224,23 @@ async def start_web_server():
 
     runner = web.AppRunner(app)
     await runner.setup()
+
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
 
+    return runner
+
 
 async def main():
-    await start_web_server()
-    await dp.start_polling(bot)
+    await setup_database()
+    runner = await start_web_server()
+
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
+        await db_pool.close()
+        await runner.cleanup()
 
 
 if __name__ == "__main__":
