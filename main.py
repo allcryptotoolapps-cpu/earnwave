@@ -15,6 +15,9 @@ if not TOKEN:
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
+# ইউজারের পয়েন্ট রাখার সহজ ডিকশনারি (পরীক্ষার জন্য)
+user_points: dict[int, int] = {}
+
 keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="🎬 Watch Ads")],
@@ -27,6 +30,8 @@ keyboard = ReplyKeyboardMarkup(
 
 @dp.message(CommandStart())
 async def start(message: Message):
+    user_id = message.from_user.id
+    user_points.setdefault(user_id, 0)
     await message.answer(
         "Welcome to EarnWave! 🌟\n\n"
         "Earn points by watching ads and completing tasks.",
@@ -34,11 +39,47 @@ async def start(message: Message):
     )
 
 
-@dp.message()
-async def menu(message: Message):
+@dp.message(lambda msg: msg.text == "🎬 Watch Ads")
+async def watch_ads(message: Message):
+    user_id = message.from_user.id
+    current = user_points.get(user_id, 0) + 10
+    user_points[user_id] = current
     await message.answer(
-        "This feature is coming soon! 🚀"
+        f"🎉 You earned +10 points!\n"
+        f"💰 Your balance: {current} points"
     )
+
+
+@dp.message(lambda msg: msg.text == "💰 Balance")
+async def balance(message: Message):
+    user_id = message.from_user.id
+    current = user_points.get(user_id, 0)
+    await message.answer(f"💰 Your current balance: {current} points")
+
+
+@dp.message(lambda msg: msg.text == "📋 Tasks")
+async def tasks(message: Message):
+    await message.answer(
+        "📋 Available Tasks:\n"
+        "• Watch ads regularly to collect points.\n"
+        "• More tasks will be added soon!"
+    )
+
+
+@dp.message(lambda msg: msg.text == "💳 Withdraw")
+async def withdraw(message: Message):
+    user_id = message.from_user.id
+    current = user_points.get(user_id, 0)
+    await message.answer(
+        f"💳 Withdraw Info:\n"
+        f"• Current balance: {current} points\n"
+        f"• Minimum required: 100 points"
+    )
+
+
+@dp.message()
+async def fallback(message: Message):
+    await message.answer("Please use the menu buttons below. 👇", reply_markup=keyboard)
 
 
 async def health_handler(request: web.Request):
