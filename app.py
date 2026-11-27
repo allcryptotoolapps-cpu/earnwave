@@ -440,29 +440,44 @@ async def create_web_app():
     return app
 
 
+
 async def main():
-    if not MINI_APP_URL:
-        raise RuntimeError("Set MINI_APP_URL to the public HTTPS URL of this Render service, e.g. https://your-service.onrender.com/app")
     await core.setup_database()
-    # Replace the old chat keyboard with a single Mini App launch button.
-    core.keyboard = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="🚀 Open EarnWave", web_app=WebAppInfo(url=MINI_APP_URL))]],
-        resize_keyboard=True,
-        is_persistent=True,
-    )
-    await core.bot.set_chat_menu_button(menu_button=MenuButtonWebApp(text="Open EarnWave", web_app=WebAppInfo(url=MINI_APP_URL)))
-    runner=web.AppRunner(await create_web_app())
+
+    if MINI_APP_URL:
+        core.keyboard = ReplyKeyboardMarkup(
+            keyboard=[[
+                KeyboardButton(
+                    text="🚀 Open EarnWave",
+                    web_app=WebAppInfo(url=MINI_APP_URL)
+                )
+            ]],
+            resize_keyboard=True,
+            is_persistent=True,
+        )
+
+        await core.bot.set_chat_menu_button(
+            menu_button=MenuButtonWebApp(
+                text="Open EarnWave",
+                web_app=WebAppInfo(url=MINI_APP_URL)
+            )
+        )
+
+    runner = web.AppRunner(await create_web_app())
     await runner.setup()
-    port=int(os.getenv("PORT","10000"))
-    await web.TCPSite(runner,"0.0.0.0",port).start()
+
+    port = int(os.getenv("PORT", "10000"))
+    await web.TCPSite(runner, "0.0.0.0", port).start()
+
     print(f"EarnWave Mini App listening on port {port}")
+
     try:
-        await core.dp.start_polling(core.bot)
+        await asyncio.Event().wait()
     finally:
         await core.bot.session.close()
         await core.db_pool.close()
         await runner.cleanup()
 
 
-if __name__=="__main__":
+if __name__ == "__main__":
     asyncio.run(main())
