@@ -652,8 +652,6 @@ async def create_withdrawal(message: Message):
 
 
 
-
-
 @dp.message(Command("withdrawals"))
 async def pending_withdrawals(message: Message):
     if not await is_admin(message.from_user.id):
