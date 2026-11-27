@@ -53,11 +53,19 @@ keyboard = ReplyKeyboardMarkup(
 
 # ---------------- DATABASE ----------------
 
+
 async def setup_database():
     global db_pool
-    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+
+    db_pool = await asyncpg.create_pool(
+        DATABASE_URL,
+        min_size=1,
+        max_size=5
+    )
 
     async with db_pool.acquire() as conn:
+
+        # USERS
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id BIGINT PRIMARY KEY,
@@ -69,18 +77,27 @@ async def setup_database():
                 language TEXT NOT NULL DEFAULT 'en'
             )
         """)
+
         await conn.execute("""
-            ALTER TABLE users ADD COLUMN IF NOT EXISTS is_banned BOOLEAN NOT NULL DEFAULT FALSE;
-            ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by BIGINT;
-            ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_paid BOOLEAN NOT NULL DEFAULT FALSE;
-            ALTER TABLE users ADD COLUMN IF NOT EXISTS language TEXT NOT NULL DEFAULT 'en';
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS is_banned BOOLEAN NOT NULL DEFAULT FALSE;
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS referred_by BIGINT;
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS referral_paid BOOLEAN NOT NULL DEFAULT FALSE;
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS language TEXT NOT NULL DEFAULT 'en';
         """)
+
+        # SETTINGS
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             )
         """)
+
+        # TASKS
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS tasks (
                 task_id BIGSERIAL PRIMARY KEY,
@@ -89,6 +106,8 @@ async def setup_database():
                 active BOOLEAN NOT NULL DEFAULT TRUE
             )
         """)
+
+        # SUBMISSIONS
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS submissions (
                 submission_id BIGSERIAL PRIMARY KEY,
@@ -99,6 +118,8 @@ async def setup_database():
                 created_at TIMESTAMPTZ DEFAULT NOW()
             )
         """)
+
+        # USER WITHDRAWALS
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS withdrawals (
                 withdrawal_id BIGSERIAL PRIMARY KEY,
@@ -109,6 +130,93 @@ async def setup_database():
                 created_at TIMESTAMPTZ DEFAULT NOW()
             )
         """)
+
+        # ADVERTISER WALLETS
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS advertiser_wallets (
+                user_id BIGINT PRIMARY KEY,
+                available NUMERIC(20,8) NOT NULL DEFAULT 0,
+                reserved NUMERIC(20,8) NOT NULL DEFAULT 0,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+
+        # ADVERTISER TRANSACTIONS
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS advertiser_transactions (
+                tx_id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                tx_type TEXT NOT NULL,
+                amount NUMERIC(20,8) NOT NULL,
+                network TEXT,
+                reference TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                note TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+
+        # PREVENT DUPLICATE DEPOSIT TXIDs
+        await conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS
+            unique_advertiser_deposit_txid
+            ON advertiser_transactions (LOWER(reference))
+            WHERE tx_type = 'deposit'
+            AND reference IS NOT NULL
+        """)
+
+        # CAMPAIGNS
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS campaigns (
+                campaign_id BIGSERIAL PRIMARY KEY,
+                advertiser_id BIGINT NOT NULL,
+                title TEXT NOT NULL,
+                channel_link TEXT NOT NULL,
+                target_members INTEGER NOT NULL,
+                reward_per_join NUMERIC(20,8) NOT NULL,
+                total_budget NUMERIC(20,8) NOT NULL,
+                spent NUMERIC(20,8) NOT NULL DEFAULT 0,
+                verified_joins INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'pending_payment',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                chat_id TEXT
+            )
+        """)
+
+        # ADD CHAT ID TO EXISTING CAMPAIGNS TABLE
+        await conn.execute("""
+            ALTER TABLE campaigns
+            ADD COLUMN IF NOT EXISTS chat_id TEXT
+        """)
+
+        # CAMPAIGN JOINS
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS campaign_joins (
+                join_id BIGSERIAL PRIMARY KEY,
+                campaign_id BIGINT NOT NULL
+                    REFERENCES campaigns(campaign_id),
+                user_id BIGINT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE(campaign_id, user_id)
+            )
+        """)
+
+        # ADVERTISER WITHDRAWALS
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS advertiser_withdrawals (
+                withdrawal_id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                amount NUMERIC(20,8) NOT NULL,
+                network TEXT NOT NULL,
+                wallet TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+
+    print("PostgreSQL connected successfully!")
 
         # Advertiser wallet: amounts are USDT. Available and reserved are separate.
         await conn.execute("""
