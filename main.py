@@ -52,8 +52,6 @@ keyboard = ReplyKeyboardMarkup(
 
 
 # ---------------- DATABASE ----------------
-
-
 async def setup_database():
     global db_pool
 
