@@ -174,7 +174,6 @@ async def setup_database():
             ALTER TABLE campaigns
             ADD COLUMN IF NOT EXISTS chat_id TEXT;
         """)
-        
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS campaign_joins (
                 join_id BIGSERIAL PRIMARY KEY,
