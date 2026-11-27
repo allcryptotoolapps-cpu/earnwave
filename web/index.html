@@ -1,119 +1,711 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>EarnWave</title>
-  <script src="https://telegram.org/js/telegram-web-app.js"></script>
-  <style>
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      padding: 25px 18px;
-      background: #080d19;
-      color: white;
-      font-family: Arial, sans-serif;
-    }
-    header { margin-bottom: 25px; }
-    .logo { color: #829fff; font-weight: bold; letter-spacing: 3px; }
-    h1 { font-size: 28px; margin-bottom: 5px; }
-    .muted { color: #9ba9c3; }
-    .balance {
-      background: linear-gradient(135deg,#294b91,#172747);
-      padding: 24px;
-      border-radius: 20px;
-      margin: 20px 0;
-    }
-    .amount { font-size: 34px; font-weight: bold; margin: 12px 0; }
-    nav {
-      display: flex;
-      gap: 8px;
-      overflow-x: auto;
-      margin: 20px 0;
-    }
-    button {
-      border: 0;
-      border-radius: 10px;
-      padding: 12px 16px;
-      background: #1b2943;
-      color: white;
-      font-size: 14px;
-    }
-    button.active { background: #496bc0; }
-    .card {
-      background: #121d31;
-      border: 1px solid #263653;
-      border-radius: 15px;
-      padding: 18px;
-      margin: 12px 0;
-    }
-    .section { display: none; }
-    .section.active { display: block; }
-  </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>EarnWave</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+:root{--bg:#080e1b;--panel:#111d31;--panel2:#172640;--border:#263957;--text:#f4f7ff;--muted:#94a5c2;--blue:#527cff;--green:#20c997;--red:#ff647c;--yellow:#ffc857}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font-family:Arial,sans-serif;padding:0 0 90px}
+button,input,textarea,select{font:inherit}
+button{border:0;cursor:pointer}
+button:disabled{opacity:.45;cursor:not-allowed}
+header{padding:22px 18px 12px}
+.brand{font-size:13px;font-weight:800;letter-spacing:4px;color:#91aaff}
+.header-row{display:flex;justify-content:space-between;align-items:center;margin-top:13px}
+h1{font-size:25px;margin:0}
+h2{font-size:20px;margin:10px 0 15px}
+h3{font-size:16px;margin:0 0 10px}
+p{line-height:1.5}
+.muted{color:var(--muted)}
+.small{font-size:12px}
+main{padding:0 16px}
+.balance{padding:23px;border-radius:20px;background:linear-gradient(135deg,#3159ad,#172746);margin:12px 0 18px;box-shadow:0 8px 25px #0003}
+.balance .amount{font-size:34px;font-weight:800;margin:10px 0}
+.balance-grid{display:flex;justify-content:space-between;gap:10px;margin-top:18px}
+.balance-grid div{font-size:12px;color:#d0dcf8}
+.balance-grid strong{display:block;font-size:17px;color:white;margin-top:5px}
+.stats{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin:14px 0}
+.stat{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:15px}
+.stat strong{display:block;font-size:20px;margin-top:7px}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:15px;padding:16px;margin:11px 0}
+.card-head{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}
+.badge{display:inline-block;padding:5px 9px;border-radius:20px;background:#263a5d;color:#c6d8ff;font-size:11px}
+.badge.green{background:#123d35;color:#70e5c3}
+.badge.red{background:#492331;color:#ff9bad}
+.badge.yellow{background:#493b1e;color:#ffdc8b}
+.btn{padding:12px 15px;border-radius:11px;background:var(--blue);color:white;font-weight:700}
+.btn.secondary{background:#263a5b}
+.btn.success{background:#137c61}
+.btn.danger{background:#8c3046}
+.btn.full{width:100%;margin-top:10px}
+.btn.smallbtn{padding:8px 10px;font-size:12px}
+.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+input,textarea,select{width:100%;padding:13px;border:1px solid var(--border);border-radius:11px;background:#0b1527;color:white;outline:none;margin:6px 0 12px}
+textarea{min-height:85px;resize:vertical}
+label{display:block;font-size:12px;color:var(--muted);margin-top:8px}
+.section{display:none}
+.section.active{display:block}
+.bottom-nav{position:fixed;bottom:0;left:0;right:0;background:#0e192b;border-top:1px solid var(--border);display:flex;justify-content:space-around;padding:9px 3px calc(9px + env(safe-area-inset-bottom));z-index:10}
+.nav-btn{background:transparent;color:var(--muted);font-size:10px;padding:6px 4px;min-width:16%;display:flex;flex-direction:column;align-items:center;gap:5px}
+.nav-btn span:first-child{font-size:19px}
+.nav-btn.active{color:#9eb5ff}
+.page-title{margin:12px 0 15px}
+.row{display:flex;justify-content:space-between;gap:10px;align-items:center}
+.value{font-weight:700;overflow-wrap:anywhere}
+.divider{height:1px;background:var(--border);margin:13px 0}
+.empty{text-align:center;padding:25px 12px;color:var(--muted)}
+.toast{position:fixed;left:16px;right:16px;bottom:83px;padding:13px 15px;background:#243754;color:white;border:1px solid #47638d;border-radius:12px;z-index:30;display:none;box-shadow:0 8px 30px #0008}
+.toast.error{background:#512638;border-color:#a64c66}
+.toast.show{display:block}
+.progress{height:7px;background:#263653;border-radius:10px;overflow:hidden;margin:12px 0}
+.progress span{display:block;height:100%;background:var(--green)}
+.link{color:#9bb4ff;overflow-wrap:anywhere}
+.hidden{display:none!important}
+.admin-label{color:#ffc857;font-weight:bold;font-size:12px;letter-spacing:1px}
+</style>
 </head>
 <body>
-  <header>
-    <div class="logo">EARNWAVE</div>
-    <h1>Welcome to EarnWave</h1>
-    <p class="muted">Your rewards dashboard</p>
-  </header>
 
+<header>
+  <div class="brand">EARNWAVE</div>
+  <div class="header-row">
+    <div>
+      <h1 id="greeting">Welcome!</h1>
+      <div class="muted small">Your rewards dashboard</div>
+    </div>
+    <span class="badge" id="connection">Connecting...</span>
+  </div>
+</header>
+
+<main>
   <div class="balance">
-    <div class="muted">YOUR BALANCE</div>
+    <div class="small">YOUR POINTS BALANCE</div>
     <div class="amount" id="balance">0 Points</div>
-    <div class="muted">1,000 Points = $1 USDT</div>
+    <div class="small">1,000 Points = 1 USDT</div>
+    <div class="balance-grid">
+      <div>USDT Equivalent<strong id="usdtValue">$0.000</strong></div>
+      <div>Minimum Withdrawal<strong id="minWithdraw">5,000 Points</strong></div>
+    </div>
   </div>
 
-  <nav>
-    <button class="active" onclick="show('home',this)">Home</button>
-    <button onclick="show('tasks',this)">Tasks</button>
-    <button onclick="show('campaigns',this)">Campaigns</button>
-    <button onclick="show('wallet',this)">Wallet</button>
-    <button onclick="show('profile',this)">Profile</button>
-  </nav>
-
-  <div id="home" class="section active">
-    <h2>Dashboard</h2>
-    <div class="card">Welcome to EarnWave! Complete tasks and earn points.</div>
+  <div class="stats">
+    <div class="stat"><span class="muted small">Total Referrals</span><strong id="refCount">0</strong></div>
+    <div class="stat"><span class="muted small">Paid Referrals</span><strong id="paidRefCount">0</strong></div>
+    <div class="stat"><span class="muted small">Available Tasks</span><strong id="taskCount">0</strong></div>
+    <div class="stat"><span class="muted small">Active Campaigns</span><strong id="campaignCount">0</strong></div>
   </div>
 
-  <div id="tasks" class="section">
-    <h2>Available Tasks</h2>
-    <div class="card">Tasks will appear here.</div>
-  </div>
+  <section id="home" class="section active">
+    <h2 class="page-title">Dashboard</h2>
+    <div class="card">
+      <h3>Welcome to EarnWave 🚀</h3>
+      <p class="muted small">Complete available tasks, join campaigns and earn points. Withdraw your eligible points through the wallet.</p>
+      <div class="actions">
+        <button class="btn" onclick="navigate('tasks')">Explore Tasks</button>
+        <button class="btn secondary" onclick="navigate('campaigns')">View Campaigns</button>
+      </div>
+    </div>
+    <div class="card">
+      <div class="row"><h3>Recent Activity</h3><button class="btn smallbtn secondary" onclick="navigate('wallet')">View All</button></div>
+      <div id="homeHistory" class="muted small">Loading activity...</div>
+    </div>
+  </section>
 
-  <div id="campaigns" class="section">
-    <h2>Campaigns</h2>
-    <div class="card">Campaigns will appear here.</div>
-  </div>
+  <section id="tasks" class="section">
+    <h2 class="page-title">Available Tasks</h2>
+    <p class="muted small">Complete a task and submit proof for admin review.</p>
+    <div id="taskList"><div class="empty">Loading tasks...</div></div>
+  </section>
 
-  <div id="wallet" class="section">
-    <h2>Wallet</h2>
-    <div class="card">Your withdrawal and transaction details will appear here.</div>
-  </div>
+  <section id="campaigns" class="section">
+    <h2 class="page-title">Campaigns</h2>
+    <p class="muted small">Join the advertised channel or group, then return and verify your membership.</p>
+    <div id="campaignList"><div class="empty">Loading campaigns...</div></div>
+  </section>
 
-  <div id="profile" class="section">
-    <h2>Profile</h2>
-    <div class="card" id="user">Telegram user</div>
-  </div>
+  <section id="wallet" class="section">
+    <h2 class="page-title">My Wallet</h2>
+    <div class="card">
+      <h3>Points Withdrawal</h3>
+      <div class="row"><span class="muted small">Your points</span><strong id="walletPoints">0</strong></div>
+      <label>Points to withdraw</label>
+      <input id="withdrawPoints" type="number" min="1" placeholder="Enter points">
+      <label>Network</label>
+      <select id="withdrawNetwork"><option value="TRC20">USDT TRC20</option><option value="BEP20">USDT BEP20</option></select>
+      <label>USDT wallet address</label>
+      <input id="withdrawAddress" placeholder="Enter your wallet address">
+      <button class="btn full" onclick="submitPointsWithdrawal()">Request Withdrawal</button>
+      <p class="muted small">Minimum withdrawal: <span id="withdrawMinText">5,000</span> points. Requests are processed manually by admin.</p>
+    </div>
 
-  <script>
-    const tg = window.Telegram.WebApp;
-    tg.ready();
-    tg.expand();
+    <div class="card">
+      <h3>Advertiser Wallet</h3>
+      <div class="row"><span class="muted small">Available balance</span><strong id="advAvailable">0.00 USDT</strong></div>
+      <div class="row"><span class="muted small">Reserved balance</span><strong id="advReserved">0.00 USDT</strong></div>
+    </div>
 
-    const user = tg.initDataUnsafe?.user;
-    if (user) {
-      document.getElementById('user').textContent =
-        user.first_name + (user.username ? ' (@' + user.username + ')' : '');
+    <div class="card">
+      <h3>Deposit USDT</h3>
+      <p class="muted small">Send USDT to one of the supported addresses. Then submit the transaction hash for verification.</p>
+      <label>TRC20 Deposit Address</label>
+      <div class="row"><div class="link small" id="trcAddress">Not available</div><button class="btn smallbtn secondary" onclick="copyText('trcAddress')">Copy</button></div>
+      <label>BEP20 Deposit Address</label>
+      <div class="row"><div class="link small" id="bepAddress">Not available</div><button class="btn smallbtn secondary" onclick="copyText('bepAddress')">Copy</button></div>
+      <label>Deposit amount (USDT)</label>
+      <input id="depositAmount" type="number" min="0.00000001" step="0.00000001" placeholder="Amount">
+      <label>Network</label>
+      <select id="depositNetwork"><option value="TRC20">TRC20</option><option value="BEP20">BEP20</option></select>
+      <label>Transaction hash (TXID)</label>
+      <input id="depositTxid" placeholder="Paste transaction hash">
+      <button class="btn full" onclick="submitDeposit()">Submit Deposit Proof</button>
+    </div>
+
+    <div class="card">
+      <h3>Advertiser Withdrawal</h3>
+      <p class="muted small">Withdraw available advertiser funds to your USDT wallet.</p>
+      <label>Amount (USDT)</label>
+      <input id="advWithdrawAmount" type="number" min="0.00000001" step="0.00000001" placeholder="Amount">
+      <label>Network</label>
+      <select id="advWithdrawNetwork"><option value="TRC20">TRC20</option><option value="BEP20">BEP20</option></select>
+      <label>Wallet address</label>
+      <input id="advWithdrawAddress" placeholder="USDT wallet address">
+      <button class="btn full" onclick="submitAdvWithdrawal()">Request Advertiser Withdrawal</button>
+      <div class="muted small" id="advMinText"></div>
+    </div>
+
+    <div class="card">
+      <h3>Transaction History</h3>
+      <div id="historyList"><div class="empty">Loading history...</div></div>
+    </div>
+  </section>
+
+  <section id="referral" class="section">
+    <h2 class="page-title">Referral Program</h2>
+    <div class="card">
+      <h3>Invite Friends 🎁</h3>
+      <p class="muted small">Share your referral link. Earn the referral bonus according to the program rules.</p>
+      <div class="stat"><span class="muted small">Referral Bonus</span><strong id="refBonus">0 Points</strong></div>
+      <label>Your referral link</label>
+      <input id="refLink" readonly>
+      <button class="btn full" onclick="copyReferral()">Copy Referral Link</button>
+      <div class="divider"></div>
+      <div class="row"><span class="muted">Total referrals</span><strong id="refTotal">0</strong></div>
+      <div class="row"><span class="muted">Paid referrals</span><strong id="paidRefTotal">0</strong></div>
+    </div>
+  </section>
+
+  <section id="profile" class="section">
+    <h2 class="page-title">My Profile</h2>
+    <div class="card">
+      <h3>Telegram Account</h3>
+      <div class="row"><span class="muted">Name</span><strong id="profileName">-</strong></div>
+      <div class="divider"></div>
+      <div class="row"><span class="muted">Username</span><strong id="profileUsername">-</strong></div>
+      <div class="divider"></div>
+      <div class="row"><span class="muted">Telegram ID</span><strong id="profileId">-</strong></div>
+      <div class="divider"></div>
+      <div class="row"><span class="muted">Language</span><strong id="profileLanguage">-</strong></div>
+      <div class="divider"></div>
+      <div class="row"><span class="muted">Account Type</span><strong id="profileRole">User</strong></div>
+    </div>
+  </section>
+
+  <section id="admin" class="section">
+    <h2 class="page-title">Admin Dashboard <span class="admin-label">ADMIN</span></h2>
+    <div class="stats">
+      <div class="stat"><span class="muted small">Total Users</span><strong id="adminUsers">0</strong></div>
+      <div class="stat"><span class="muted small">Total Points</span><strong id="adminPoints">0</strong></div>
+      <div class="stat"><span class="muted small">Pending Withdrawals</span><strong id="adminWithdrawals">0</strong></div>
+      <div class="stat"><span class="muted small">Pending Deposits</span><strong id="adminDeposits">0</strong></div>
+      <div class="stat"><span class="muted small">Pending Submissions</span><strong id="adminSubmissions">0</strong></div>
+      <div class="stat"><span class="muted small">Pending Campaigns</span><strong id="adminCampaigns">0</strong></div>
+    </div>
+    <div class="card">
+      <h3>Admin Management</h3>
+      <label>Select management section</label>
+      <select id="adminKind" onchange="loadAdminList()">
+        <option value="submissions">Task Submissions</option>
+        <option value="withdrawals">Points Withdrawals</option>
+        <option value="deposits">Advertiser Deposits</option>
+        <option value="advwithdrawals">Advertiser Withdrawals</option>
+        <option value="campaigns">Campaigns</option>
+        <option value="users">Users</option>
+      </select>
+      <div id="adminList"><div class="empty">Select a section.</div></div>
+    </div>
+    <div class="card">
+      <h3>Add New Task</h3>
+      <label>Task title</label>
+      <input id="newTaskTitle" maxlength="250" placeholder="Enter task title">
+      <label>Reward (points)</label>
+      <input id="newTaskReward" type="number" min="1" placeholder="Enter reward">
+      <button class="btn full" onclick="addAdminTask()">Add Task</button>
+    </div>
+    <div class="card">
+      <h3>Deactivate Task</h3>
+      <label>Task ID</label>
+      <input id="deactivateTaskId" type="number" min="1" placeholder="Enter task ID">
+      <button class="btn danger full" onclick="deactivateTask()">Deactivate Task</button>
+    </div>
+  </section>
+</main>
+
+<nav class="bottom-nav">
+  <button class="nav-btn active" data-page="home" onclick="navigate('home')"><span>⌂</span><span>Home</span></button>
+  <button class="nav-btn" data-page="tasks" onclick="navigate('tasks')"><span>✓</span><span>Tasks</span></button>
+  <button class="nav-btn" data-page="campaigns" onclick="navigate('campaigns')"><span>◈</span><span>Campaigns</span></button>
+  <button class="nav-btn" data-page="wallet" onclick="navigate('wallet')"><span>▣</span><span>Wallet</span></button>
+  <button class="nav-btn" data-page="referral" onclick="navigate('referral')"><span>♧</span><span>Invite</span></button>
+  <button class="nav-btn" data-page="profile" onclick="navigate('profile')"><span>●</span><span>Profile</span></button>
+</nav>
+
+<div id="toast" class="toast"></div>
+
+<script>
+"use strict";
+
+const tg = window.Telegram && window.Telegram.WebApp;
+if (tg) {
+  tg.ready();
+  tg.expand();
+  try { tg.setHeaderColor("#080e1b"); tg.setBackgroundColor("#080e1b"); } catch(e) {}
+}
+
+const API_BASE = "";
+let me = null;
+let walletData = null;
+let isAdmin = false;
+let toastTimer = null;
+
+function esc(value) {
+  return String(value ?? "").replace(/[&<>"']/g, c => ({
+    "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"
+  }[c]));
+}
+
+function toast(message, error=false) {
+  const el = document.getElementById("toast");
+  el.textContent = message;
+  el.className = "toast show" + (error ? " error" : "");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.className = "toast", 3500);
+}
+
+async function api(path, options={}) {
+  if (!tg || !tg.initData) {
+    throw new Error("Please open EarnWave from Telegram.");
+  }
+  const headers = {
+    "X-Telegram-Init-Data": tg.initData,
+    ...(options.body ? {"Content-Type":"application/json"} : {}),
+    ...(options.headers || {})
+  };
+  let response;
+  try {
+    response = await fetch(API_BASE + path, {...options, headers});
+  } catch(e) {
+    throw new Error("Network error. Please try again.");
+  }
+  let data;
+  try { data = await response.json(); }
+  catch(e) { data = {}; }
+  if (!response.ok) {
+    throw new Error(data.error || data.message || "Request failed (" + response.status + ")");
+  }
+  return data;
+}
+
+function money(value, digits=2) {
+  const n = Number(value || 0);
+  return Number.isFinite(n) ? n.toFixed(digits) : (0).toFixed(digits);
+}
+
+function navigate(page) {
+  document.querySelectorAll(".section").forEach(s => s.classList.remove("active"));
+  document.querySelectorAll(".nav-btn").forEach(b => b.classList.toggle("active", b.dataset.page === page));
+  const section = document.getElementById(page);
+  if (section) section.classList.add("active");
+  if (page === "wallet") refreshWallet();
+  if (page === "tasks") loadTasks();
+  if (page === "campaigns") loadCampaigns();
+  if (page === "admin") { loadAdminSummary(); loadAdminList(); }
+  if (page === "home") loadHomeHistory();
+  window.scrollTo({top:0,behavior:"smooth"});
+}
+
+function showError(containerId, message) {
+  document.getElementById(containerId).innerHTML =
+    `<div class="empty">${esc(message)}</div>`;
+}
+
+async function loadMe() {
+  const data = await api("/api/me");
+  me = data;
+  isAdmin = !!data.is_admin;
+  document.getElementById("greeting").textContent =
+    "Hello, " + (data.user?.first_name || "there") + "!";
+  document.getElementById("balance").textContent = Number(data.points || 0).toLocaleString() + " Points";
+  document.getElementById("usdtValue").textContent = "$" + money(data.usdt_value,3);
+  document.getElementById("minWithdraw").textContent = Number(data.min_withdraw || 5000).toLocaleString() + " Points";
+  document.getElementById("withdrawMinText").textContent = Number(data.min_withdraw || 5000).toLocaleString();
+  document.getElementById("walletPoints").textContent = Number(data.points || 0).toLocaleString();
+  document.getElementById("refCount").textContent = data.referrals || 0;
+  document.getElementById("paidRefCount").textContent = data.paid_referrals || 0;
+  document.getElementById("taskCount").textContent = data.task_count || 0;
+  document.getElementById("campaignCount").textContent = data.campaign_count || 0;
+  document.getElementById("refBonus").textContent = (data.referral_bonus || 0) + " Points";
+  document.getElementById("refTotal").textContent = data.referrals || 0;
+  document.getElementById("paidRefTotal").textContent = data.paid_referrals || 0;
+  document.getElementById("refLink").value = data.referral_link || "";
+  document.getElementById("profileName").textContent =
+    [data.user?.first_name,data.user?.last_name].filter(Boolean).join(" ") || "-";
+  document.getElementById("profileUsername").textContent =
+    data.user?.username ? "@" + data.user.username : "Not set";
+  document.getElementById("profileId").textContent = data.user?.id || "-";
+  document.getElementById("profileLanguage").textContent = data.language || "en";
+  document.getElementById("profileRole").textContent = isAdmin ? "Administrator" : "User";
+  document.getElementById("connection").textContent = "Connected";
+  if (isAdmin) {
+    const nav = document.querySelector(".bottom-nav");
+    const button = document.createElement("button");
+    button.className = "nav-btn";
+    button.dataset.page = "admin";
+    button.innerHTML = "<span>⚙</span><span>Admin</span>";
+    button.onclick = () => navigate("admin");
+    nav.appendChild(button);
+  }
+}
+
+async function loadTasks() {
+  const box = document.getElementById("taskList");
+  box.innerHTML = '<div class="empty">Loading tasks...</div>';
+  try {
+    const data = await api("/api/tasks");
+    if (!data.tasks?.length) return showError("taskList","No tasks available right now.");
+    box.innerHTML = data.tasks.map(t => {
+      const status = t.status || "";
+      const submitted = status === "pending" || status === "approved";
+      return `<div class="card">
+        <div class="card-head"><h3>${esc(t.title)}</h3><span class="badge">${Number(t.reward).toLocaleString()} Points</span></div>
+        <p class="muted small">Task ID: ${esc(t.id)}</p>
+        ${status ? `<span class="badge ${status==="approved"?"green":status==="rejected"?"red":"yellow"}">${esc(status.toUpperCase())}</span>` : ""}
+        ${submitted ? "" : `<label>Proof / Screenshot link / Details</label>
+        <textarea id="proof-${Number(t.id)}" maxlength="2000" placeholder="Enter your proof"></textarea>
+        <button class="btn full" onclick="submitTask(${Number(t.id)})">Submit Proof</button>`}
+      </div>`;
+    }).join("");
+  } catch(e) { showError("taskList",e.message); }
+}
+
+async function submitTask(id) {
+  const proof = document.getElementById("proof-" + id)?.value.trim();
+  if (!proof) return toast("Please enter your proof.",true);
+  try {
+    await api("/api/tasks/submit",{method:"POST",body:JSON.stringify({task_id:id,proof})});
+    toast("Task proof submitted successfully.");
+    loadTasks();
+  } catch(e) { toast(e.message,true); }
+}
+
+async function loadCampaigns() {
+  const box = document.getElementById("campaignList");
+  box.innerHTML = '<div class="empty">Loading campaigns...</div>';
+  try {
+    const data = await api("/api/campaigns");
+    if (!data.campaigns?.length) return showError("campaignList","No active campaigns available.");
+    box.innerHTML = data.campaigns.map(c => {
+      const id = Number(c.id);
+      const status = c.status || "";
+      const progress = c.target ? Math.min(100,Number(c.joined)/Number(c.target)*100) : 0;
+      return `<div class="card">
+        <div class="card-head"><h3>${esc(c.title)}</h3><span class="badge">${c.is_test ? "TEST" : money(c.reward,4)+" USDT"}</span></div>
+        <p class="muted small">Campaign #${id}</p>
+        <div class="row small"><span class="muted">Verified members</span><strong>${Number(c.joined||0)} / ${Number(c.target||0)}</strong></div>
+        <div class="progress"><span style="width:${progress}%"></span></div>
+        ${status ? `<span class="badge ${status==="approved"?"green":"yellow"}">${esc(status.toUpperCase())}</span>` : ""}
+        <div class="actions">
+          <button class="btn secondary" onclick="joinCampaign(${id})">Join Channel / Group</button>
+          <button class="btn success" onclick="verifyCampaign(${id})">Verify</button>
+        </div>
+        <p class="muted small">First join the channel or group. Then return here and tap Verify.</p>
+      </div>`;
+    }).join("");
+  } catch(e) { showError("campaignList",e.message); }
+}
+
+async function joinCampaign(id) {
+  try {
+    const data = await api("/api/campaigns/" + id + "/join",{method:"POST",body:"{}"});
+    if (data.link) {
+      if (tg?.openLink) tg.openLink(data.link);
+      else window.open(data.link,"_blank");
     }
+    toast(data.message || "Join the channel, then verify.");
+    loadCampaigns();
+  } catch(e) { toast(e.message,true); }
+}
 
-    function show(id, button) {
-      document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
-      document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
-      document.getElementById(id).classList.add('active');
-      button.classList.add('active');
+async function verifyCampaign(id) {
+  try {
+    const data = await api("/api/campaigns/" + id + "/verify",{method:"POST",body:"{}"});
+    toast(data.message || "Membership verified.");
+    await loadMe();
+    loadCampaigns();
+  } catch(e) { toast(e.message,true); }
+}
+
+async function refreshWallet() {
+  try {
+    const data = await api("/api/wallet");
+    walletData = data;
+    document.getElementById("advAvailable").textContent = money(data.available) + " USDT";
+    document.getElementById("advReserved").textContent = money(data.reserved) + " USDT";
+    document.getElementById("trcAddress").textContent = data.trc20 || "Not configured";
+    document.getElementById("bepAddress").textContent = data.bep20 || "Not configured";
+    document.getElementById("advMinText").textContent = "Minimum advertiser withdrawal: " + data.min_withdraw + " USDT";
+    await loadHistory();
+  } catch(e) { toast(e.message,true); }
+}
+
+async function submitPointsWithdrawal() {
+  const points = Number(document.getElementById("withdrawPoints").value);
+  const network = document.getElementById("withdrawNetwork").value;
+  const wallet = document.getElementById("withdrawAddress").value.trim();
+  if (!Number.isInteger(points) || points <= 0 || !wallet) return toast("Enter valid points and wallet address.",true);
+  try {
+    const data = await api("/api/withdraw",{method:"POST",body:JSON.stringify({points,network,wallet})});
+    toast(data.message || "Withdrawal request submitted.");
+    document.getElementById("withdrawPoints").value = "";
+    document.getElementById("withdrawAddress").value = "";
+    await loadMe(); await loadHistory();
+  } catch(e) { toast(e.message,true); }
+}
+
+async function submitDeposit() {
+  const amount = document.getElementById("depositAmount").value.trim();
+  const network = document.getElementById("depositNetwork").value;
+  const txid = document.getElementById("depositTxid").value.trim();
+  if (!amount || Number(amount)<=0 || !txid) return toast("Enter amount and transaction hash.",true);
+  try {
+    const data = await api("/api/deposit-proof",{method:"POST",body:JSON.stringify({amount,network,txid})});
+    toast(data.message || "Deposit proof submitted.");
+    document.getElementById("depositAmount").value = "";
+    document.getElementById("depositTxid").value = "";
+    loadHistory();
+  } catch(e) { toast(e.message,true); }
+}
+
+async function submitAdvWithdrawal() {
+  const amount = document.getElementById("advWithdrawAmount").value.trim();
+  const network = document.getElementById("advWithdrawNetwork").value;
+  const wallet = document.getElementById("advWithdrawAddress").value.trim();
+  if (!amount || Number(amount)<=0 || !wallet) return toast("Enter valid amount and wallet address.",true);
+  try {
+    const data = await api("/api/advwithdraw",{method:"POST",body:JSON.stringify({amount,network,wallet})});
+    toast(data.message || "Withdrawal request submitted.");
+    document.getElementById("advWithdrawAmount").value = "";
+    document.getElementById("advWithdrawAddress").value = "";
+    await refreshWallet();
+  } catch(e) { toast(e.message,true); }
+}
+
+async function loadHistory() {
+  const box = document.getElementById("historyList");
+  box.innerHTML = '<div class="empty">Loading history...</div>';
+  try {
+    const data = await api("/api/history");
+    if (!data.items?.length) return showError("historyList","No transactions yet.");
+    box.innerHTML = data.items.map(item => `
+      <div class="card">
+        <div class="row"><strong>${esc(item.type)}</strong><span class="badge ${item.status==="paid"||item.status==="approved"?"green":item.status==="rejected"?"red":"yellow"}">${esc(item.status)}</span></div>
+        <p class="value">${esc(item.amount)}</p>
+        <div class="muted small">${esc(item.network)} · ${esc(item.created_at || "")}</div>
+        ${item.txid ? `<p class="small link">TXID: ${esc(item.txid)}</p>` : ""}
+      </div>`).join("");
+  } catch(e) { showError("historyList",e.message); }
+}
+
+async function loadHomeHistory() {
+  const box = document.getElementById("homeHistory");
+  try {
+    const data = await api("/api/history");
+    if (!data.items?.length) return box.textContent = "No recent activity.";
+    box.innerHTML = data.items.slice(0,3).map(i =>
+      `<div class="row"><span>${esc(i.type)}</span><span>${esc(i.amount)}</span></div><div class="muted small">${esc(i.status)} · ${esc(i.created_at)}</div><div class="divider"></div>`
+    ).join("");
+  } catch(e) { box.textContent = e.message; }
+}
+
+async function copyText(id) {
+  const value = document.getElementById(id)?.textContent || "";
+  if (!value || value==="Not available" || value==="Not configured") return toast("Address is not configured.",true);
+  try {
+    await navigator.clipboard.writeText(value);
+    toast("Copied to clipboard.");
+  } catch(e) { toast("Could not copy. Please copy manually.",true); }
+}
+
+async function copyReferral() {
+  const value = document.getElementById("refLink").value;
+  if (!value) return toast("Referral link unavailable.",true);
+  try {
+    await navigator.clipboard.writeText(value);
+    toast("Referral link copied.");
+  } catch(e) {
+    if (tg?.openTelegramLink) tg.openTelegramLink("https://t.me/share/url?url=" + encodeURIComponent(value));
+    else toast("Could not copy referral link.",true);
+  }
+}
+
+async function loadAdminSummary() {
+  if (!isAdmin) return;
+  try {
+    const d = await api("/api/admin/summary");
+    document.getElementById("adminUsers").textContent = Number(d.users||0).toLocaleString();
+    document.getElementById("adminPoints").textContent = Number(d.points||0).toLocaleString();
+    document.getElementById("adminWithdrawals").textContent = d.pending_withdrawals||0;
+    document.getElementById("adminDeposits").textContent = d.pending_deposits||0;
+    document.getElementById("adminSubmissions").textContent = d.pending_submissions||0;
+    document.getElementById("adminCampaigns").textContent = d.pending_campaigns||0;
+  } catch(e) { toast(e.message,true); }
+}
+
+async function loadAdminList() {
+  if (!isAdmin) return;
+  const kind = document.getElementById("adminKind").value;
+  const box = document.getElementById("adminList");
+  box.innerHTML = '<div class="empty">Loading...</div>';
+  try {
+    const data = await api("/api/admin/" + kind);
+    if (!data.items?.length) return showError("adminList","No records found.");
+    box.innerHTML = data.items.map(item => adminItemHTML(kind,item)).join("");
+  } catch(e) { showError("adminList",e.message); }
+}
+
+function adminItemHTML(kind,item) {
+  const id = Number(item.submission_id ?? item.withdrawal_id ?? item.tx_id ?? item.campaign_id ?? item.user_id);
+  const title = kind==="submissions" ? "Task Submission #" + id :
+    kind==="withdrawals" ? "Points Withdrawal #" + id :
+    kind==="deposits" ? "Deposit #" + id :
+    kind==="advwithdrawals" ? "Advertiser Withdrawal #" + id :
+    kind==="campaigns" ? "Campaign #" + id : "User #" + id;
+
+  let details = "";
+  if (kind==="submissions") details = `User: ${esc(item.user_id)}<br>Task ID: ${esc(item.task_id)}<br>Proof: ${esc(item.proof)}`;
+  if (kind==="withdrawals") details = `User: ${esc(item.user_id)}<br>Amount: ${esc(item.amount)} points<br>Wallet: ${esc(item.wallet)}<br>Status: ${esc(item.status)}`;
+  if (kind==="deposits") details = `User: ${esc(item.user_id)}<br>Amount: ${esc(item.amount)} USDT<br>Network: ${esc(item.network)}<br>TXID: ${esc(item.reference)}`;
+  if (kind==="advwithdrawals") details = `User: ${esc(item.user_id)}<br>Amount: ${esc(item.amount)} USDT<br>Network: ${esc(item.network)}<br>Wallet: ${esc(item.wallet)}<br>Status: ${esc(item.status)}`;
+  if (kind==="campaigns") details = `${esc(item.title)}<br>Advertiser: ${esc(item.advertiser_id)}<br>Budget: ${esc(item.total_budget)} USDT<br>Status: ${esc(item.status)}<br><span class="small link">${esc(item.channel_link)}</span>`;
+  if (kind==="users") details = `Points: ${esc(item.points)}<br>Banned: ${esc(item.is_banned)}`;
+
+  let actions = "";
+  if (kind==="submissions") actions = `<button class="btn success smallbtn" onclick="adminAction('approve-submission',${id})">Approve</button><button class="btn danger smallbtn" onclick="adminAction('reject-submission',${id})">Reject</button>`;
+  if (kind==="withdrawals") {
+    if (item.status==="pending") actions = `<button class="btn success smallbtn" onclick="adminAction('approve-withdrawal',${id})">Approve</button><button class="btn danger smallbtn" onclick="adminAction('reject-withdrawal',${id})">Reject</button>`;
+    if (item.status==="approved") actions = `<button class="btn success smallbtn" onclick="adminMarkPaid(${id},false)">Mark Paid</button>`;
+  }
+  if (kind==="deposits") actions = `<button class="btn success smallbtn" onclick="adminDeposit(${id,'approve')}">Verify & Credit</button><button class="btn danger smallbtn" onclick="adminDeposit(${id,'reject')}">Reject</button>`;
+  if (kind==="advwithdrawals") {
+    if (item.status==="pending") actions = `<button class="btn success smallbtn" onclick="adminAdvWithdraw(${id},'approve')">Approve</button><button class="btn danger smallbtn" onclick="adminAdvWithdraw(${id},'reject')">Reject</button>`;
+    if (item.status==="approved") actions = `<button class="btn success smallbtn" onclick="adminMarkPaid(${id},true)">Mark Paid</button>`;
+  }
+  if (kind==="campaigns") {
+    if (item.status==="pending_payment") actions += `<button class="btn success smallbtn" onclick="adminAction('approve-campaign',${id})">Approve</button>`;
+    if (item.status==="pending_payment" || item.status==="pending_review") actions += `<button class="btn danger smallbtn" onclick="adminAction('reject-campaign',${id})">Reject</button>`;
+  }
+  return `<div class="card"><h3>${title}</h3><p class="small muted">${details}</p>${actions ? `<div class="actions">${actions}</div>` : ""}</div>`;
+}
+
+async function adminAction(action,id,extra={}) {
+  if (!confirm("Are you sure you want to perform this action?")) return;
+  try {
+    const data = await api("/api/admin/action/" + action,{method:"POST",body:JSON.stringify({id,...extra})});
+    toast(data.message || "Action completed.");
+    await loadAdminList(); await loadAdminSummary();
+  } catch(e) { toast(e.message,true); }
+}
+
+async function adminMarkPaid(id,isAdv) {
+  const txid = prompt("Enter the transaction hash (TXID):");
+  if (!txid) return;
+  try {
+    if (isAdv) {
+      await api("/api/admin/advwithdraw-action",{method:"POST",body:JSON.stringify({id,action:"paid",txid})});
+    } else {
+      await api("/api/admin/action/mark-withdrawal-paid",{method:"POST",body:JSON.stringify({id,txid})});
     }
-  </script>
+    toast("Payment marked as paid.");
+    await loadAdminList(); await loadAdminSummary();
+  } catch(e) { toast(e.message,true); }
+}
+
+async function adminDeposit(id,action) {
+  if (!confirm(action==="approve" ? "Verify this deposit on the blockchain and credit the wallet?" : "Reject this deposit?")) return;
+  try {
+    const data = await api("/api/admin/deposit-action",{method:"POST",body:JSON.stringify({id,action})});
+    toast(data.message || "Deposit action completed.");
+    await loadAdminList(); await loadAdminSummary();
+  } catch(e) { toast(e.message,true); }
+}
+
+async function adminAdvWithdraw(id,action) {
+  if (!confirm("Confirm advertiser withdrawal " + action + "?")) return;
+  try {
+    const data = await api("/api/admin/advwithdraw-action",{method:"POST",body:JSON.stringify({id,action})});
+    toast(data.message || "Action completed.");
+    await loadAdminList(); await loadAdminSummary();
+  } catch(e) { toast(e.message,true); }
+}
+
+async function addAdminTask() {
+  const title = document.getElementById("newTaskTitle").value.trim();
+  const reward = Number(document.getElementById("newTaskReward").value);
+  if (!title || !Number.isInteger(reward) || reward<=0) return toast("Enter a valid task title and reward.",true);
+  try {
+    const data = await api("/api/admin/tasks",{method:"POST",body:JSON.stringify({title,reward})});
+    toast("Task added. ID: " + data.id);
+    document.getElementById("newTaskTitle").value = "";
+    document.getElementById("newTaskReward").value = "";
+    loadAdminSummary();
+  } catch(e) { toast(e.message,true); }
+}
+
+async function deactivateTask() {
+  const id = Number(document.getElementById("deactivateTaskId").value);
+  if (!Number.isInteger(id) || id<=0) return toast("Enter a valid task ID.",true);
+  if (!confirm("Deactivate task #" + id + "?")) return;
+  try {
+    await api("/api/admin/tasks/deactivate",{method:"POST",body:JSON.stringify({id})});
+    toast("Task deactivated.");
+    document.getElementById("deactivateTaskId").value = "";
+    loadAdminSummary();
+  } catch(e) { toast(e.message,true); }
+}
+
+async function startApp() {
+  if (!tg || !tg.initData) {
+    document.getElementById("connection").textContent = "Not connected";
+    document.getElementById("greeting").textContent = "Open from Telegram";
+    document.querySelector("main").innerHTML =
+      '<div class="card"><h2>Telegram Login Required</h2><p class="muted">Please open EarnWave using the Telegram bot Mini App button.</p></div>';
+    return;
+  }
+  try {
+    await loadMe();
+    await loadTasks();
+    await loadCampaigns();
+    await refreshWallet();
+    await loadHomeHistory();
+  } catch(e) {
+    document.getElementById("connection").textContent = "Error";
+    toast(e.message,true);
+  }
+}
+
+startApp();
+</script>
 </body>
 </html>
