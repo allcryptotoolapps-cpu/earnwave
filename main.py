@@ -1561,45 +1561,126 @@ async def advertise_menu(message: Message):
 async def create_campaign(message: Message):
     if not await allowed(message):
         return
+
     try:
         raw = message.text.split(maxsplit=1)[1]
         parts = [p.strip() for p in raw.split("|")]
+
         if len(parts) != 4:
             raise ValueError
+
         title, link, target_text, reward_text = parts
         target = int(target_text)
         reward = parse_usdt(reward_text)
-        if not title or not link.startswith("https://t.me/") or target < 1 or target > 100000:
+
+        if (
+            not title
+            or not link.startswith("https://t.me/")
+            or link.startswith("https://t.me/+")
+            or target < 1
+            or target > 100000
+        ):
             raise ValueError
+
+        username = link.rstrip("/").split("/")[-1]
+
+        if not username or username.startswith("+"):
+            raise ValueError
+
+        # Find the Telegram channel
+        chat = await bot.get_chat("@" + username)
+
+        if chat.type not in ("channel", "supergroup"):
+            await message.answer("Please provide a valid public channel or group link.")
+            return
+
+        # Check whether EarnWave bot is an administrator
+        me = await bot.get_me()
+        bot_member = await bot.get_chat_member(chat.id, me.id)
+
+        if bot_member.status not in ("administrator", "creator"):
+            await message.answer(
+                "Please make EarnWave Bot an admin in your channel/group first."
+            )
+            return
+
         budget = (reward * target).quantize(Decimal("0.00000001"))
+
         if budget < Decimal("1"):
             await message.answer("Campaign budget must be at least 1 USDT.")
             return
+
         uid = message.from_user.id
+
         async with db_pool.acquire() as conn:
             async with conn.transaction():
-                wallet = await conn.fetchrow("SELECT available FROM advertiser_wallets WHERE user_id = $1 FOR UPDATE", uid)
+
+                wallet = await conn.fetchrow("""
+                    SELECT available
+                    FROM advertiser_wallets
+                    WHERE user_id = $1
+                    FOR UPDATE
+                """, uid)
+
                 if not wallet or Decimal(wallet["available"]) < budget:
-                    await message.answer(f"Insufficient available balance. Required: {budget} USDT. Use /deposit first.")
+                    await message.answer(
+                        f"Insufficient available balance. Required: {budget} USDT. Use /deposit first."
+                    )
                     return
-                await conn.execute("UPDATE advertiser_wallets SET available = available - $1, reserved = reserved + $1, updated_at = NOW() WHERE user_id = $2", budget, uid)
+
+                await conn.execute("""
+                    UPDATE advertiser_wallets
+                    SET available = available - $1,
+                        reserved = reserved + $1,
+                        updated_at = NOW()
+                    WHERE user_id = $2
+                """, budget, uid)
+
                 cid = await conn.fetchval("""
-                    INSERT INTO campaigns (advertiser_id, title, channel_link, target_members, reward_per_join, total_budget)
-                    VALUES ($1, $2, $3, $4, $5, $6) RETURNING campaign_id
-                """, uid, title, link, target, reward, budget)
+                    INSERT INTO campaigns (
+                        advertiser_id, title, channel_link,
+                        target_members, reward_per_join,
+                        total_budget, chat_id
+                    )
+                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    RETURNING campaign_id
+                """, uid, title, link, target, reward, budget, str(chat.id))
+
         await message.answer(
-            f"✅ Campaign request #{cid} created.\n"
-            f"Target: {target} joins\nReward per verified join: {reward} USDT\n"
-            f"Reserved budget: {budget} USDT\nStatus: Pending admin review.\n"
-            "The campaign is not public until approved."
+            f"Campaign request #{cid} created.\n"
+            f"Channel: {title}\n"
+            f"Target: {target} joins\n"
+            f"Reward per join: {reward} USDT\n"
+            f"Reserved budget: {budget} USDT\n"
+            "Status: Pending admin review."
         )
+
         for admin_id in ADMIN_IDS:
             try:
-                await bot.send_message(admin_id, f"📢 New campaign #{cid}\nAdvertiser: {uid}\nTitle: {title}\nLink: {link}\nTarget: {target}\nReward/join: {reward} USDT\nBudget: {budget} USDT\nReview: /campaigns")
+                await bot.send_message(
+                    admin_id,
+                    f"New campaign #{cid}\n"
+                    f"Advertiser: {uid}\n"
+                    f"Title: {title}\n"
+                    f"Link: {link}\n"
+                    f"Channel ID: {chat.id}\n"
+                    f"Target: {target}\n"
+                    f"Reward: {reward} USDT\n"
+                    f"Budget: {budget} USDT\n"
+                    "Review with /campaigns"
+                )
             except Exception:
                 pass
+
     except (ValueError, IndexError):
-        await message.answer("Use:\n/createcampaign TITLE | https://t.me/channel | TARGET_MEMBERS | REWARD_PER_JOIN_USDT")
+        await message.answer(
+            "Use:\n/createcampaign TITLE | https://t.me/channel | TARGET_MEMBERS | REWARD_PER_JOIN_USDT"
+        )
+    except Exception as e:
+        print(f"Campaign creation error: {e}")
+        await message.answer(
+            "Could not verify this channel. Make sure EarnWave Bot is an admin and the public channel link is correct."
+        )
 
 
 @dp.message(Command("mycampaigns"))
