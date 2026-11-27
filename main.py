@@ -217,6 +217,7 @@ async def setup_database():
         """)
 
     print("PostgreSQL connected successfully!")
+    
 
         # Advertiser wallet: amounts are USDT. Available and reserved are separate.
         await conn.execute("""
