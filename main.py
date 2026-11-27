@@ -1779,39 +1779,216 @@ async def reject_campaign(message: Message):
         await message.answer("Use: /rejectcampaign ID")
 
 
+
 @dp.message(Command("joincampaign"))
 async def join_campaign(message: Message):
     if not await allowed(message):
         return
+
     try:
         cid = int(message.text.split()[1])
         uid = message.from_user.id
+
         async with db_pool.acquire() as conn:
             campaign = await conn.fetchrow("""
-                SELECT campaign_id, title, channel_link, target_members, verified_joins
-                FROM campaigns WHERE campaign_id = $1 AND status = 'active'
+                SELECT campaign_id, title, channel_link, chat_id,
+                       target_members, verified_joins
+                FROM campaigns
+                WHERE campaign_id = $1 AND status = 'active'
             """, cid)
+
             if not campaign:
                 await message.answer("Campaign not found or not active.")
                 return
+
             if campaign["verified_joins"] >= campaign["target_members"]:
-                await message.answer("This campaign has reached its target.")
+                await message.answer("Campaign target already reached.")
                 return
-            inserted = await conn.fetchval("""
+
+            if not campaign["chat_id"]:
+                await message.answer("Campaign verification is not configured.")
+                return
+
+            await conn.execute("""
                 INSERT INTO campaign_joins (campaign_id, user_id)
-                VALUES ($1, $2) ON CONFLICT (campaign_id, user_id) DO NOTHING
-                RETURNING join_id
+                VALUES ($1, $2)
+                ON CONFLICT (campaign_id, user_id) DO NOTHING
             """, cid, uid)
-        if not inserted:
-            await message.answer("You have already joined/submitted this campaign.")
+
+            join_status = await conn.fetchval("""
+                SELECT status FROM campaign_joins
+                WHERE campaign_id = $1 AND user_id = $2
+            """, cid, uid)
+
+        if join_status == "approved":
+            await message.answer("You have already received your reward.")
             return
+
+        if join_status == "rejected":
+            await message.answer("Your previous join request was rejected.")
+            return
+
         await message.answer(
-            f"Campaign: {campaign['title']}\nJoin here: {campaign['channel_link']}\n\n"
-            f"After joining, send proof with:\n/campaignproof {cid} YOUR_PROOF\n"
-            "Reward is credited only after verification."
+            f"📢 Campaign: {campaign['title']}\n\n"
+            f"Join Channel:\n{campaign['channel_link']}\n\n"
+            f"After joining, send:\n"
+            f"/verifycampaign {cid}\n\n"
+            "The bot will check your membership automatically."
         )
+
     except (ValueError, IndexError):
         await message.answer("Use: /joincampaign CAMPAIGN_ID")
+
+
+@dp.message(Command("verifycampaign"))
+async def verify_campaign(message: Message):
+    if not await allowed(message):
+        return
+
+    try:
+        cid = int(message.text.split()[1])
+        uid = message.from_user.id
+
+        points_per_usdt = Decimal(
+            str(await get_setting("points_per_usdt", "1000"))
+        )
+
+        async with db_pool.acquire() as conn:
+            async with conn.transaction():
+
+                campaign = await conn.fetchrow("""
+                    SELECT * FROM campaigns
+                    WHERE campaign_id = $1 AND status = 'active'
+                    FOR UPDATE
+                """, cid)
+
+                if not campaign:
+                    await message.answer("Campaign not found or no longer active.")
+                    return
+
+                join = await conn.fetchrow("""
+                    SELECT * FROM campaign_joins
+                    WHERE campaign_id = $1 AND user_id = $2
+                    FOR UPDATE
+                """, cid, uid)
+
+                if not join:
+                    await message.answer("First use /joincampaign ID.")
+                    return
+
+                if join["status"] == "approved":
+                    await message.answer("You have already received your reward.")
+                    return
+
+                if join["status"] != "pending":
+                    await message.answer("Your join request is not pending.")
+                    return
+
+                if campaign["verified_joins"] >= campaign["target_members"]:
+                    await message.answer("Campaign target already reached.")
+                    return
+
+                if not campaign["chat_id"]:
+                    await message.answer("Channel ID is missing.")
+                    return
+
+                # Check actual Telegram membership
+                try:
+                    member = await bot.get_chat_member(
+                        chat_id=campaign["chat_id"],
+                        user_id=uid
+                    )
+
+                    is_member = (
+                        member.status in ("member", "administrator", "creator")
+                        or (
+                            member.status == "restricted"
+                            and getattr(member, "is_member", False)
+                        )
+                    )
+
+                except Exception as e:
+                    print(f"Membership check error: {e}")
+                    await message.answer(
+                        "Could not check membership. Please try again later."
+                    )
+                    return
+
+                if not is_member:
+                    await message.answer(
+                        "❌ You are not a member of this channel yet.\n"
+                        "Join the channel first, then try again."
+                    )
+                    return
+
+                reward = campaign["reward_per_join"]
+                new_spent = campaign["spent"] + reward
+
+                if new_spent > campaign["total_budget"]:
+                    await message.answer("Campaign budget exhausted.")
+                    return
+
+                points = int(
+                    (reward * points_per_usdt).to_integral_value()
+                )
+
+                await conn.execute("""
+                    UPDATE campaign_joins
+                    SET status = 'approved'
+                    WHERE join_id = $1
+                """, join["join_id"])
+
+                await conn.execute("""
+                    UPDATE campaigns
+                    SET verified_joins = verified_joins + 1,
+                        spent = spent + $1,
+                        updated_at = NOW()
+                    WHERE campaign_id = $2
+                """, reward, cid)
+
+                await conn.execute("""
+                    UPDATE advertiser_wallets
+                    SET reserved = GREATEST(reserved - $1, 0),
+                        updated_at = NOW()
+                    WHERE user_id = $2
+                """, reward, campaign["advertiser_id"])
+
+                await conn.execute("""
+                    UPDATE users
+                    SET points = points + $1
+                    WHERE user_id = $2
+                """, points, uid)
+
+                if campaign["verified_joins"] + 1 >= campaign["target_members"]:
+                    remaining = campaign["total_budget"] - new_spent
+
+                    await conn.execute("""
+                        UPDATE campaigns
+                        SET status = 'completed',
+                            updated_at = NOW()
+                        WHERE campaign_id = $1
+                    """, cid)
+
+                    if remaining > 0:
+                        await conn.execute("""
+                            UPDATE advertiser_wallets
+                            SET available = available + $1,
+                                reserved = GREATEST(reserved - $1, 0),
+                                updated_at = NOW()
+                            WHERE user_id = $2
+                        """, remaining, campaign["advertiser_id"])
+
+        await message.answer(
+            f"✅ Membership verified!\n"
+            f"🎁 Reward: +{points} Points\n"
+            f"Campaign: #{cid}"
+        )
+
+    except (ValueError, IndexError):
+        await message.answer("Use: /verifycampaign CAMPAIGN_ID")
+    except Exception as e:
+        print(f"Campaign verification error: {e}")
+        await message.answer("Verification failed. Please try again later.")
 
 
 @dp.message(Command("campaignproof"))
