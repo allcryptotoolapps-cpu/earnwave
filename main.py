@@ -52,6 +52,7 @@ keyboard = ReplyKeyboardMarkup(
 
 
 # ---------------- DATABASE ----------------
+
 async def setup_database():
     global db_pool
 
@@ -215,95 +216,7 @@ async def setup_database():
         """)
 
     print("PostgreSQL connected successfully!")
-    
 
-        # Advertiser wallet: amounts are USDT. Available and reserved are separate.
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS advertiser_wallets (
-                user_id BIGINT PRIMARY KEY,
-                available NUMERIC(20,8) NOT NULL DEFAULT 0,
-                reserved NUMERIC(20,8) NOT NULL DEFAULT 0,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS advertiser_transactions (
-                tx_id BIGSERIAL PRIMARY KEY,
-                user_id BIGINT NOT NULL,
-                tx_type TEXT NOT NULL,
-                amount NUMERIC(20,8) NOT NULL,
-                network TEXT,
-                reference TEXT,
-                status TEXT NOT NULL DEFAULT 'pending',
-                note TEXT,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-        """)
-        await conn.execute("""
-    CREATE UNIQUE INDEX IF NOT EXISTS
-    unique_advertiser_deposit_txid
-    ON advertiser_transactions (LOWER(reference))
-    WHERE tx_type = 'deposit' AND reference IS NOT NULL
-""")
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS campaigns (
-                campaign_id BIGSERIAL PRIMARY KEY,
-                advertiser_id BIGINT NOT NULL,
-                title TEXT NOT NULL,
-                channel_link TEXT NOT NULL,
-                target_members INTEGER NOT NULL,
-                reward_per_join NUMERIC(20,8) NOT NULL,
-                total_budget NUMERIC(20,8) NOT NULL,
-                spent NUMERIC(20,8) NOT NULL DEFAULT 0,
-                verified_joins INTEGER NOT NULL DEFAULT 0,
-                status TEXT NOT NULL DEFAULT 'pending_payment',
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-        """)
-                await conn.execute("""
-            CREATE TABLE IF NOT EXISTS campaigns (
-                campaign_id BIGSERIAL PRIMARY KEY,
-                advertiser_id BIGINT NOT NULL,
-                title TEXT NOT NULL,
-                channel_link TEXT NOT NULL,
-                target_members INTEGER NOT NULL,
-                reward_per_join NUMERIC(20,8) NOT NULL,
-                total_budget NUMERIC(20,8) NOT NULL,
-                spent NUMERIC(20,8) NOT NULL DEFAULT 0,
-                verified_joins INTEGER NOT NULL DEFAULT 0,
-                status TEXT NOT NULL DEFAULT 'pending_payment',
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-        """)
-        await conn.execute("""
-            ALTER TABLE campaigns
-            ADD COLUMN IF NOT EXISTS chat_id TEXT;
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS campaign_joins (
-                join_id BIGSERIAL PRIMARY KEY,
-                campaign_id BIGINT NOT NULL REFERENCES campaigns(campaign_id),
-                user_id BIGINT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                UNIQUE(campaign_id, user_id)
-            )
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS advertiser_withdrawals (
-                withdrawal_id BIGSERIAL PRIMARY KEY,
-                user_id BIGINT NOT NULL,
-                amount NUMERIC(20,8) NOT NULL,
-                network TEXT NOT NULL,
-                wallet TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-        """)
-
-    print("PostgreSQL connected successfully!")
 
 
 async def get_setting(key, default):
