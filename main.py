@@ -2050,36 +2050,6 @@ async def verify_campaign(message: Message):
         await message.answer("Verification failed. Please try again later.")
 
 
-@dp.message(Command("campaignproof"))
-async def campaign_proof(message: Message):
-    if not await allowed(message):
-        return
-    try:
-        _, cid_text, proof = message.text.split(maxsplit=2)
-        cid = int(cid_text)
-        async with db_pool.acquire() as conn:
-            row = await conn.fetchrow("""
-                UPDATE campaign_joins SET status = 'pending'
-                WHERE campaign_id = $1 AND user_id = $2 AND status = 'pending'
-                RETURNING join_id
-            """, cid, message.from_user.id)
-            if not row:
-                await message.answer("No join request found. First use /joincampaign ID.")
-                return
-            await conn.execute("""
-                INSERT INTO advertiser_transactions (user_id, tx_type, amount, network, reference, status, note)
-                VALUES ($1, 'joinproof', 0, NULL, $2, 'pending', $3)
-            """, message.from_user.id, proof[:250], f"Campaign {cid}")
-        await message.answer("✅ Proof submitted. Admin will verify your membership before rewarding you.")
-        for admin_id in ADMIN_IDS:
-            try:
-                await bot.send_message(admin_id, f"Join proof pending\nCampaign: {cid}\nUser: {message.from_user.id}\nProof: {proof[:250]}\nUse /approvejoin {cid} {message.from_user.id} or /rejectjoin {cid} {message.from_user.id}")
-            except Exception:
-                pass
-    except (ValueError, IndexError):
-        await message.answer("Use: /campaignproof CAMPAIGN_ID YOUR_PROOF")
-
-
 @dp.message(Command("approvejoin"))
 async def approve_join(message: Message):
     if not await is_admin(message.from_user.id):
