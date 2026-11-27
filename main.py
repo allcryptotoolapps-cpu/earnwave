@@ -1,3 +1,4 @@
+import aiohttp
 import asyncio
 import os
 import math
@@ -132,6 +133,12 @@ async def setup_database():
             )
         """)
         await conn.execute("""
+    CREATE UNIQUE INDEX IF NOT EXISTS
+    unique_advertiser_deposit_txid
+    ON advertiser_transactions (LOWER(reference))
+    WHERE tx_type = 'deposit' AND reference IS NOT NULL
+""")
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS campaigns (
                 campaign_id BIGSERIAL PRIMARY KEY,
                 advertiser_id BIGINT NOT NULL,
@@ -243,14 +250,132 @@ async def allowed(message):
     return True
 
 
-def parse_usdt(value):
-    try:
-        amount = Decimal(value).quantize(Decimal("0.00000001"))
-    except (InvalidOperation, ValueError):
-        raise ValueError
-    if not amount.is_finite() or amount <= 0:
-        raise ValueError
-    return amount
+
+async def verify_deposit_on_blockchain(network, txid, amount):
+    if len(txid) != 64 or any(c not in "0123456789abcdefABCDEF" for c in txid):
+        return False
+
+    if network == "TRC20":
+        address = await get_setting(
+            "deposit_address_TRC20", USDT_TRC20_ADDRESS
+        )
+        api_key = os.getenv("TRONGRID_API_KEY", "")
+
+        if not address or not api_key:
+            raise RuntimeError("TRON address or API key missing")
+
+        expected = amount * Decimal(10 ** 6)
+        if expected != expected.to_integral_value():
+            return False
+
+        url = f"https://api.trongrid.io/v1/accounts/{address}/transactions/trc20"
+        params = {
+            "only_confirmed": "true",
+            "only_to": "true",
+            "limit": 200,
+            "contract_address": "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t",
+            "order_by": "block_timestamp,desc"
+        }
+        headers = {"TRON-PRO-API-KEY": api_key}
+
+        async with aiohttp.ClientSession() as session:
+            for _ in range(20):
+                async with session.get(
+                    url, params=params, headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=25)
+                ) as response:
+                    response.raise_for_status()
+                    result = await response.json()
+
+                for item in result.get("data", []):
+                    if (
+                        item.get("transaction_id", "").lower() == txid.lower()
+                        and item.get("to") == address
+                        and item.get("token_info", {}).get("address")
+                        == "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+                        and int(item.get("value", "0")) == int(expected)
+                    ):
+                        return True
+
+                fingerprint = result.get("meta", {}).get("fingerprint")
+                if not fingerprint:
+                    break
+                params["fingerprint"] = fingerprint
+
+        return False
+
+    elif network == "BEP20":
+        address = await get_setting(
+            "deposit_address_BEP20", USDT_BEP20_ADDRESS
+        )
+
+        if not address or not address.startswith("0x") or len(address) != 42:
+            raise RuntimeError("Invalid BEP20 deposit address")
+
+        expected = amount * Decimal(10 ** 18)
+        if expected != expected.to_integral_value():
+            return False
+
+        token = "0x55d398326f99059fF775485246999027B3197955"
+        transfer_topic = (
+            "0xddf252ad1be2c89b69c2b068fc378daa"
+            "952ba7f163c4a11628f55a4df523b3ef"
+        )
+
+        async with aiohttp.ClientSession() as session:
+            async def rpc(method, params):
+                async with session.post(
+                    "https://bsc-dataseed.binance.org/",
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": method,
+                        "params": params
+                    },
+                    timeout=aiohttp.ClientTimeout(total=25)
+                ) as response:
+                    response.raise_for_status()
+                    data = await response.json()
+
+                if "error" in data or "result" not in data:
+                    raise RuntimeError("BSC RPC verification failed")
+                return data["result"]
+
+            chain_id = await rpc("eth_chainId", [])
+            if chain_id != "0x38":
+                return False
+
+            receipt = await rpc(
+                "eth_getTransactionReceipt", ["0x" + txid]
+            )
+
+            if not receipt or receipt.get("status") != "0x1":
+                return False
+
+            latest = await rpc("eth_blockNumber", [])
+            confirmations = (
+                int(latest, 16) - int(receipt["blockNumber"], 16)
+            )
+
+            if confirmations < 12:
+                return False
+
+            for log in receipt.get("logs", []):
+                topics = log.get("topics", [])
+
+                if (
+                    log.get("address", "").lower() == token.lower()
+                    and len(topics) >= 3
+                    and topics[0].lower() == transfer_topic
+                    and topics[2][-40:].lower() == address[2:].lower()
+                    and int(log.get("data", "0x0"), 16) == int(expected)
+                ):
+                    return True
+
+        return False
+
+    return False
+
 
 
 async def ensure_wallet(user_id):
@@ -1091,37 +1216,118 @@ async def admin_deposits(message: Message):
     await message.answer(out)
 
 
+
 @dp.message(Command("approvedeposit"))
 async def approve_deposit(message: Message):
     if not await is_admin(message.from_user.id):
         return
+
     try:
         txid = int(message.text.split()[1])
+
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT * FROM advertiser_transactions
+                WHERE tx_id = $1
+                AND tx_type = 'deposit'
+                AND status = 'pending'
+            """, txid)
+
+        if not row:
+            await message.answer("Pending deposit not found.")
+            return
+
+        # Verify actual blockchain transaction
+        try:
+            verified = await verify_deposit_on_blockchain(
+                row["network"],
+                row["reference"],
+                row["amount"]
+            )
+        except Exception as e:
+            await message.answer(
+                f"Blockchain verification error: {str(e)[:250]}\n"
+                "No balance was credited."
+            )
+            return
+
+        if not verified:
+            await message.answer(
+                "❌ Blockchain verification failed.\n"
+                "No balance was credited."
+            )
+            return
+
         async with db_pool.acquire() as conn:
             async with conn.transaction():
-                row = await conn.fetchrow("""
+
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext($1))",
+                    row["reference"].lower()
+                )
+
+                current = await conn.fetchrow("""
                     SELECT * FROM advertiser_transactions
-                    WHERE tx_id = $1 AND tx_type = 'deposit' AND status = 'pending'
+                    WHERE tx_id = $1
+                    AND tx_type = 'deposit'
+                    AND status = 'pending'
                     FOR UPDATE
                 """, txid)
-                if not row:
-                    await message.answer("Pending deposit not found.")
+
+                if not current:
+                    await message.answer(
+                        "Deposit already processed."
+                    )
                     return
-                await conn.execute("UPDATE advertiser_transactions SET status = 'approved' WHERE tx_id = $1", txid)
+
+                duplicate = await conn.fetchval("""
+                    SELECT EXISTS(
+                        SELECT 1 FROM advertiser_transactions
+                        WHERE tx_type = 'deposit'
+                        AND LOWER(reference) = LOWER($1)
+                        AND status = 'approved'
+                        AND tx_id != $2
+                    )
+                """, row["reference"], txid)
+
+                if duplicate:
+                    await message.answer(
+                        "This transaction was already credited."
+                    )
+                    return
+
+                await conn.execute("""
+                    UPDATE advertiser_transactions
+                    SET status = 'approved'
+                    WHERE tx_id = $1
+                """, txid)
+
                 await conn.execute("""
                     INSERT INTO advertiser_wallets (user_id, available)
                     VALUES ($1, $2)
                     ON CONFLICT (user_id) DO UPDATE
-                    SET available = advertiser_wallets.available + EXCLUDED.available,
+                    SET available = advertiser_wallets.available
+                        + EXCLUDED.available,
                         updated_at = NOW()
                 """, row["user_id"], row["amount"])
-        await message.answer(f"✅ Deposit #{txid} approved. Wallet credited {row['amount']} USDT.")
+
+        await message.answer(
+            f"✅ Deposit #{txid} verified and approved.\n"
+            f"Wallet credited: {row['amount']} USDT."
+        )
+
         try:
-            await bot.send_message(row["user_id"], f"✅ Your deposit #{txid} was approved. {row['amount']} USDT added to your Advertiser Wallet.")
+            await bot.send_message(
+                row["user_id"],
+                f"✅ Your deposit #{txid} was verified.\n"
+                f"{row['amount']} USDT added to your Advertiser Wallet."
+            )
         except Exception:
             pass
+
     except (ValueError, IndexError):
         await message.answer("Use: /approvedeposit TX_ID")
+
 
 
 @dp.message(Command("rejectdeposit"))
