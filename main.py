@@ -653,43 +653,86 @@ async def create_withdrawal(message: Message):
 
 
 
+
 @dp.message(Command("withdrawals"))
 async def pending_withdrawals(message: Message):
     if not await is_admin(message.from_user.id):
         return
 
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch("""
-            SELECT withdrawal_id, user_id, amount, wallet
-            FROM withdrawals
-            WHERE status = 'pending'
-            ORDER BY withdrawal_id DESC
-            LIMIT 20
-        """)
+    try:
+        parts = message.text.split(maxsplit=1)
 
-    if not rows:
-        await message.answer("No pending withdrawals.")
-        return
+        status_filter = "all"
+        if len(parts) > 1:
+            status_filter = parts[1].lower()
 
-    out = "💳 PENDING WITHDRAWALS\n\n"
-
-    for r in rows:
-        saved_wallet = r["wallet"]
-        if "|" in saved_wallet:
-            network, wallet = saved_wallet.split("|", 1)
-        else:
-            network, wallet = "OLD REQUEST", saved_wallet
-
-        out += (
-            f"ID: {r['withdrawal_id']}\n"
-            f"User: {r['user_id']}\n"
-            f"Amount: {r['amount']} points "
-            f"(${r['amount'] / 1000:.2f} USDT)\n"
-            f"Network: {network}\n"
-            f"Wallet: {wallet}\n\n"
+        allowed_statuses = (
+            "all", "pending", "approved", "paid", "rejected"
         )
 
-    await message.answer(out)
+        if status_filter not in allowed_statuses:
+            await message.answer(
+                "Use:\n"
+                "/withdrawals\n"
+                "/withdrawals pending\n"
+                "/withdrawals approved\n"
+                "/withdrawals paid\n"
+                "/withdrawals rejected"
+            )
+            return
+
+        async with db_pool.acquire() as conn:
+            if status_filter == "all":
+                rows = await conn.fetch("""
+                    SELECT withdrawal_id, user_id, amount,
+                           wallet, status, txid
+                    FROM withdrawals
+                    ORDER BY withdrawal_id DESC
+                    LIMIT 30
+                """)
+            else:
+                rows = await conn.fetch("""
+                    SELECT withdrawal_id, user_id, amount,
+                           wallet, status, txid
+                    FROM withdrawals
+                    WHERE status = $1
+                    ORDER BY withdrawal_id DESC
+                    LIMIT 30
+                """, status_filter)
+
+        if not rows:
+            await message.answer(
+                f"No {status_filter} withdrawals found."
+            )
+            return
+
+        out = f"💳 WITHDRAWALS: {status_filter.upper()}\n\n"
+
+        for r in rows:
+            saved_wallet = r["wallet"]
+
+            if "|" in saved_wallet:
+                network, wallet = saved_wallet.split("|", 1)
+            else:
+                network, wallet = "OLD REQUEST", saved_wallet
+
+            out += (
+                f"ID: {r['withdrawal_id']}\n"
+                f"User: {r['user_id']}\n"
+                f"Amount: {r['amount']} points "
+                f"(${r['amount'] / 1000:.2f} USDT)\n"
+                f"Network: {network}\n"
+                f"Wallet: {wallet}\n"
+                f"Status: {r['status'].upper()}\n"
+                f"TXID: {r['txid'] or 'Not available'}\n\n"
+            )
+
+        await message.answer(out)
+
+    except Exception as e:
+        await message.answer(f"Error: {str(e)}")
+
+
 
 
 
