@@ -274,7 +274,7 @@ if (tg) {
   try { tg.setHeaderColor("#080e1b"); tg.setBackgroundColor("#080e1b"); } catch(e) {}
 }
 
-const API_BASE = "";
+const API_BASE = "";   // এখানে তোমার ব্যাকএন্ডের URL দিবে যদি আলাদা হয়
 let me = null;
 let walletData = null;
 let isAdmin = false;
@@ -370,12 +370,14 @@ async function loadMe() {
   document.getElementById("connection").textContent = "Connected";
   if (isAdmin) {
     const nav = document.querySelector(".bottom-nav");
-    const button = document.createElement("button");
-    button.className = "nav-btn";
-    button.dataset.page = "admin";
-    button.innerHTML = "<span>⚙</span><span>Admin</span>";
-    button.onclick = () => navigate("admin");
-    nav.appendChild(button);
+    if (!document.querySelector('[data-page="admin"]')) {
+      const button = document.createElement("button");
+      button.className = "nav-btn";
+      button.dataset.page = "admin";
+      button.innerHTML = "<span>⚙</span><span>Admin</span>";
+      button.onclick = () => navigate("admin");
+      nav.appendChild(button);
+    }
   }
 }
 
@@ -607,7 +609,7 @@ function adminItemHTML(kind,item) {
     if (item.status==="pending") actions = `<button class="btn success smallbtn" onclick="adminAction('approve-withdrawal',${id})">Approve</button><button class="btn danger smallbtn" onclick="adminAction('reject-withdrawal',${id})">Reject</button>`;
     if (item.status==="approved") actions = `<button class="btn success smallbtn" onclick="adminMarkPaid(${id},false)">Mark Paid</button>`;
   }
-  if (kind==="deposits") actions = `<button class="btn success smallbtn" onclick="adminDeposit(${id,'approve')}">Verify & Credit</button><button class="btn danger smallbtn" onclick="adminDeposit(${id,'reject')}">Reject</button>`;
+  if (kind==="deposits") actions = `<button class="btn success smallbtn" onclick="adminDeposit(${id},'approve')">Verify & Credit</button><button class="btn danger smallbtn" onclick="adminDeposit(${id},'reject')">Reject</button>`;
   if (kind==="advwithdrawals") {
     if (item.status==="pending") actions = `<button class="btn success smallbtn" onclick="adminAdvWithdraw(${id},'approve')">Approve</button><button class="btn danger smallbtn" onclick="adminAdvWithdraw(${id},'reject')">Reject</button>`;
     if (item.status==="approved") actions = `<button class="btn success smallbtn" onclick="adminMarkPaid(${id},true)">Mark Paid</button>`;
@@ -705,11 +707,6 @@ async function startApp() {
   }
 }
 
-  document.addEventListener("click", function(e) {
-  const btn = e.target.closest("button");
-  if (btn) toast("Button click detected");
-}, true);
-  
 startApp();
 </script>
 </body>
