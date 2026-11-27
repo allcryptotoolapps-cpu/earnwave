@@ -693,27 +693,153 @@ async def pending_withdrawals(message: Message):
 
 
 
+
 @dp.message(Command("approvewithdraw"))
 async def approve_withdrawal(message: Message):
     if not await is_admin(message.from_user.id):
         return
+
     try:
         wid = int(message.text.split()[1])
+
         async with db_pool.acquire() as conn:
             row = await conn.fetchrow("""
-                UPDATE withdrawals SET status = 'approved'
-                WHERE withdrawal_id = $1 AND status = 'pending' RETURNING user_id, amount
+                UPDATE withdrawals
+                SET status = 'approved'
+                WHERE withdrawal_id = $1 AND status = 'pending'
+                RETURNING user_id, amount, wallet
             """, wid)
+
         if not row:
             await message.answer("Pending request not found.")
             return
-        await message.answer(f"✅ Withdrawal #{wid} approved. Send crypto manually.")
+
+        saved_wallet = row["wallet"]
+
+        if "|" in saved_wallet:
+            network, wallet = saved_wallet.split("|", 1)
+        else:
+            network, wallet = "OLD REQUEST", saved_wallet
+
+        usdt = row["amount"] / 1000
+
+        await message.answer(
+            f"✅ Withdrawal #{wid} approved.\n\n"
+            f"Amount: ${usdt:.2f} USDT\n"
+            f"Network: {network}\n"
+            f"Wallet: {wallet}\n\n"
+            f"After sending crypto, submit:\n"
+            f"/markpaid {wid} TXID"
+        )
+
         try:
-            await bot.send_message(row["user_id"], f"✅ Your withdrawal request #{wid} was approved.")
+            await bot.send_message(
+                row["user_id"],
+                f"⏳ Your withdrawal #{wid} has been approved. "
+                f"Payment is being processed."
+            )
         except Exception:
             pass
+
     except (ValueError, IndexError):
         await message.answer("Use: /approvewithdraw ID")
+
+
+
+@dp.message(Command("markpaid"))
+async def mark_withdrawal_paid(message: Message):
+    if not await is_admin(message.from_user.id):
+        return
+
+    try:
+        _, wid_text, txid = message.text.split(maxsplit=2)
+        wid = int(wid_text)
+        txid = txid.strip()
+
+        if not txid:
+            await message.answer("TXID is required.")
+            return
+
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                ALTER TABLE withdrawals
+                ADD COLUMN IF NOT EXISTS txid TEXT
+            """)
+
+            row = await conn.fetchrow("""
+                UPDATE withdrawals
+                SET status = 'paid', txid = $2
+                WHERE withdrawal_id = $1 AND status = 'approved'
+                RETURNING user_id, amount
+            """, wid, txid)
+
+        if not row:
+            await message.answer(
+                "Approved withdrawal not found or already paid."
+            )
+            return
+
+        await message.answer(
+            f"✅ Withdrawal #{wid} marked as PAID.\n"
+            f"TXID: {txid}"
+        )
+
+        try:
+            await bot.send_message(
+                row["user_id"],
+                f"✅ Your withdrawal #{wid} has been PAID!\n"
+                f"Amount: ${row['amount'] / 1000:.2f} USDT\n"
+                f"TXID: {txid}"
+            )
+        except Exception:
+            pass
+
+    except (ValueError, IndexError):
+        await message.answer("Use: /markpaid ID TXID")
+
+
+@dp.message(Command("mywithdrawals"))
+async def my_withdrawals(message: Message):
+    uid = message.from_user.id
+
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            ALTER TABLE withdrawals
+            ADD COLUMN IF NOT EXISTS txid TEXT
+        """)
+
+        rows = await conn.fetch("""
+            SELECT withdrawal_id, amount, wallet, status, txid
+            FROM withdrawals
+            WHERE user_id = $1
+            ORDER BY withdrawal_id DESC
+            LIMIT 10
+        """, uid)
+
+    if not rows:
+        await message.answer("You have no withdrawal history.")
+        return
+
+    out = "📋 YOUR WITHDRAWAL HISTORY\n\n"
+
+    for r in rows:
+        saved_wallet = r["wallet"]
+
+        if "|" in saved_wallet:
+            network, wallet = saved_wallet.split("|", 1)
+        else:
+            network, wallet = "OLD REQUEST", saved_wallet
+
+        out += (
+            f"ID: {r['withdrawal_id']}\n"
+            f"Amount: ${r['amount'] / 1000:.2f} USDT\n"
+            f"Network: {network}\n"
+            f"Status: {r['status'].upper()}\n"
+            f"TXID: {r['txid'] or 'Not available'}\n\n"
+        )
+
+    await message.answer(out)
+
 
 
 @dp.message(Command("rejectwithdraw"))
