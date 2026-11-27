@@ -1683,6 +1683,65 @@ async def create_campaign(message: Message):
         )
 
 
+
+@dp.message(Command("testcampaign"))
+async def create_test_campaign(message: Message):
+    if not await is_admin(message.from_user.id):
+        return
+
+    try:
+        link = message.text.split(maxsplit=1)[1].strip()
+
+        if not link.startswith("https://t.me/") or link.startswith("https://t.me/+"):
+            await message.answer("Use: /testcampaign https://t.me/ChannelName")
+            return
+
+        username = link.rstrip("/").split("/")[-1]
+        chat = await bot.get_chat("@" + username)
+
+        if chat.type not in ("channel", "supergroup"):
+            await message.answer("Invalid public channel/group.")
+            return
+
+        me = await bot.get_me()
+        bot_member = await bot.get_chat_member(chat.id, me.id)
+
+        if bot_member.status not in ("administrator", "creator"):
+            await message.answer("Make EarnWave Bot an admin first.")
+            return
+
+        async with db_pool.acquire() as conn:
+            cid = await conn.fetchval("""
+                INSERT INTO campaigns (
+                    advertiser_id, title, channel_link,
+                    target_members, reward_per_join,
+                    total_budget, chat_id, status,
+                    verified_joins, spent
+                )
+                VALUES ($1, $2, $3, 5, 0.001, 0.005, $4, 'active', 0, 0)
+                RETURNING campaign_id
+            """, message.from_user.id, "TEST: " + chat.title,
+                 link, str(chat.id))
+
+        await message.answer(
+            f"✅ Test Campaign Created!\n"
+            f"Campaign ID: {cid}\n"
+            f"Channel: {chat.title}\n"
+            f"Target: 5 members\n"
+            f"Reward: 1 test point per verified join\n"
+            f"Use: /joincampaign {cid}"
+        )
+
+    except (ValueError, IndexError):
+        await message.answer(
+            "Use: /testcampaign https://t.me/ChannelName"
+        )
+    except Exception as e:
+        print(f"Test campaign error: {e}")
+        await message.answer("Could not create test campaign. Check channel settings.")
+
+
+
 @dp.message(Command("mycampaigns"))
 async def my_campaigns(message: Message):
     if not await allowed(message):
