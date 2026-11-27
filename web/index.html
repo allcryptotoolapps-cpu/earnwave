@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>EarnWave</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 25px 18px;
+      background: #080d19;
+      color: white;
+      font-family: Arial, sans-serif;
+    }
+    header { margin-bottom: 25px; }
+    .logo { color: #829fff; font-weight: bold; letter-spacing: 3px; }
+    h1 { font-size: 28px; margin-bottom: 5px; }
+    .muted { color: #9ba9c3; }
+    .balance {
+      background: linear-gradient(135deg,#294b91,#172747);
+      padding: 24px;
+      border-radius: 20px;
+      margin: 20px 0;
+    }
+    .amount { font-size: 34px; font-weight: bold; margin: 12px 0; }
+    nav {
+      display: flex;
+      gap: 8px;
+      overflow-x: auto;
+      margin: 20px 0;
+    }
+    button {
+      border: 0;
+      border-radius: 10px;
+      padding: 12px 16px;
+      background: #1b2943;
+      color: white;
+      font-size: 14px;
+    }
+    button.active { background: #496bc0; }
+    .card {
+      background: #121d31;
+      border: 1px solid #263653;
+      border-radius: 15px;
+      padding: 18px;
+      margin: 12px 0;
+    }
+    .section { display: none; }
+    .section.active { display: block; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="logo">EARNWAVE</div>
+    <h1>Welcome to EarnWave</h1>
+    <p class="muted">Your rewards dashboard</p>
+  </header>
+
+  <div class="balance">
+    <div class="muted">YOUR BALANCE</div>
+    <div class="amount" id="balance">0 Points</div>
+    <div class="muted">1,000 Points = $1 USDT</div>
+  </div>
+
+  <nav>
+    <button class="active" onclick="show('home',this)">Home</button>
+    <button onclick="show('tasks',this)">Tasks</button>
+    <button onclick="show('campaigns',this)">Campaigns</button>
+    <button onclick="show('wallet',this)">Wallet</button>
+    <button onclick="show('profile',this)">Profile</button>
+  </nav>
+
+  <div id="home" class="section active">
+    <h2>Dashboard</h2>
+    <div class="card">Welcome to EarnWave! Complete tasks and earn points.</div>
+  </div>
+
+  <div id="tasks" class="section">
+    <h2>Available Tasks</h2>
+    <div class="card">Tasks will appear here.</div>
+  </div>
+
+  <div id="campaigns" class="section">
+    <h2>Campaigns</h2>
+    <div class="card">Campaigns will appear here.</div>
+  </div>
+
+  <div id="wallet" class="section">
+    <h2>Wallet</h2>
+    <div class="card">Your withdrawal and transaction details will appear here.</div>
+  </div>
+
+  <div id="profile" class="section">
+    <h2>Profile</h2>
+    <div class="card" id="user">Telegram user</div>
+  </div>
+
+  <script>
+    const tg = window.Telegram.WebApp;
+    tg.ready();
+    tg.expand();
+
+    const user = tg.initDataUnsafe?.user;
+    if (user) {
+      document.getElementById('user').textContent =
+        user.first_name + (user.username ? ' (@' + user.username + ')' : '');
+    }
+
+    function show(id, button) {
+      document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
+      document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
+      document.getElementById(id).classList.add('active');
+      button.classList.add('active');
+    }
+  </script>
+</body>
+</html>
