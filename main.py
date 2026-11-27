@@ -154,6 +154,27 @@ async def setup_database():
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """)
+                await conn.execute("""
+            CREATE TABLE IF NOT EXISTS campaigns (
+                campaign_id BIGSERIAL PRIMARY KEY,
+                advertiser_id BIGINT NOT NULL,
+                title TEXT NOT NULL,
+                channel_link TEXT NOT NULL,
+                target_members INTEGER NOT NULL,
+                reward_per_join NUMERIC(20,8) NOT NULL,
+                total_budget NUMERIC(20,8) NOT NULL,
+                spent NUMERIC(20,8) NOT NULL DEFAULT 0,
+                verified_joins INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'pending_payment',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        await conn.execute("""
+            ALTER TABLE campaigns
+            ADD COLUMN IF NOT EXISTS chat_id TEXT;
+        """)
+        
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS campaign_joins (
                 join_id BIGSERIAL PRIMARY KEY,
