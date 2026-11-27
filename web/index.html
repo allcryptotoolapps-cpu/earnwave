@@ -705,6 +705,11 @@ async function startApp() {
   }
 }
 
+  document.addEventListener("click", function(e) {
+  const btn = e.target.closest("button");
+  if (btn) toast("Button click detected");
+}, true);
+  
 startApp();
 </script>
 </body>
