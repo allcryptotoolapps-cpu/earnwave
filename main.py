@@ -252,8 +252,13 @@ async def allowed(message):
 
 
 async def verify_deposit_on_blockchain(network, txid, amount):
-    if len(txid) != 64 or any(c not in "0123456789abcdefABCDEF" for c in txid):
-        return False
+    txid = txid.strip()
+
+if network == "BEP20" and txid.lower().startswith("0x"):
+    txid = txid[2:]
+
+if len(txid) != 64 or any(c not in "0123456789abcdefABCDEF" for c in txid):
+    return False
 
     if network == "TRC20":
         address = await get_setting(
