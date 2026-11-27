@@ -1,17 +1,16 @@
-import aiohttp
 import asyncio
 import os
 import math
+import re
 from datetime import datetime, timezone, timedelta
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 
+import aiohttp
 import asyncpg
 from aiohttp import web
-
 from aiogram import Bot, Dispatcher
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
-
 
 TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -19,14 +18,16 @@ PORT = int(os.getenv("PORT", "10000"))
 
 COOLDOWN_SECONDS = 30
 REWARD_POINTS = 10
-MIN_WITHDRAWAL = 100
+MIN_WITHDRAWAL = 5000                 # 1,000 points = 1 USDT; minimum = 5 USDT
 REFERRAL_BONUS = 10
+POINTS_PER_USDT = Decimal("1000")
 ADMIN_IDS = {8435970103}
 
-# Set these in Render Environment before accepting advertiser deposits.
-# Use separate addresses for each network. Never share private keys.
 USDT_TRC20_ADDRESS = os.getenv("USDT_TRC20_ADDRESS", "")
 USDT_BEP20_ADDRESS = os.getenv("USDT_BEP20_ADDRESS", "")
+TRON_USDT_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+BSC_USDT_CONTRACT = "0x55d398326f99059fF775485246999027B3197955"
+TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN is missing")
@@ -51,177 +52,133 @@ keyboard = ReplyKeyboardMarkup(
 )
 
 
-# ---------------- DATABASE ----------------
+def parse_usdt(value):
+    try:
+        amount = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError):
+        raise ValueError("Invalid USDT amount")
+    if not amount.is_finite() or amount <= 0 or amount.as_tuple().exponent < -8:
+        raise ValueError("USDT amount must be positive with at most 8 decimals")
+    return amount.quantize(Decimal("0.00000001"))
+
+
+def valid_txid(txid):
+    value = txid.strip()
+    if value.lower().startswith("0x"):
+        value = value[2:]
+    return bool(re.fullmatch(r"[0-9a-fA-F]{64}", value))
+
+
+def valid_wallet(network, wallet):
+    wallet = wallet.strip()
+    if network == "BEP20":
+        return bool(re.fullmatch(r"0x[a-fA-F0-9]{40}", wallet))
+    if network == "TRC20":
+        # TRON mainnet Base58Check addresses start with T and are 34 chars.
+        return bool(re.fullmatch(r"T[1-9A-HJ-NP-Za-km-z]{33}", wallet))
+    return False
+
 
 async def setup_database():
     global db_pool
+    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    async with db_pool.acquire() as c:
+        await c.execute("""
+        CREATE TABLE IF NOT EXISTS users(
+          user_id BIGINT PRIMARY KEY, points BIGINT NOT NULL DEFAULT 0,
+          last_ad_at TIMESTAMPTZ, is_banned BOOLEAN NOT NULL DEFAULT FALSE,
+          referred_by BIGINT, referral_paid BOOLEAN NOT NULL DEFAULT FALSE,
+          language TEXT NOT NULL DEFAULT 'en');
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS is_banned BOOLEAN NOT NULL DEFAULT FALSE;
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by BIGINT;
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_paid BOOLEAN NOT NULL DEFAULT FALSE;
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS language TEXT NOT NULL DEFAULT 'en';
 
-    db_pool = await asyncpg.create_pool(
-        DATABASE_URL,
-        min_size=1,
-        max_size=5
-    )
+        CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS tasks(
+          task_id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL,
+          reward BIGINT NOT NULL, active BOOLEAN NOT NULL DEFAULT TRUE);
+        CREATE TABLE IF NOT EXISTS submissions(
+          submission_id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL,
+          task_id BIGINT NOT NULL, proof TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'pending', created_at TIMESTAMPTZ DEFAULT NOW());
+        CREATE TABLE IF NOT EXISTS withdrawals(
+          withdrawal_id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL,
+          amount BIGINT NOT NULL, wallet TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'pending', created_at TIMESTAMPTZ DEFAULT NOW());
+        ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS txid TEXT;
+        CREATE UNIQUE INDEX IF NOT EXISTS unique_user_payout_txid
+          ON withdrawals(LOWER(txid)) WHERE txid IS NOT NULL;
 
-    async with db_pool.acquire() as conn:
+        CREATE TABLE IF NOT EXISTS advertiser_wallets(
+          user_id BIGINT PRIMARY KEY, available NUMERIC(20,8) NOT NULL DEFAULT 0,
+          reserved NUMERIC(20,8) NOT NULL DEFAULT 0,
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
+        CREATE TABLE IF NOT EXISTS advertiser_transactions(
+          tx_id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL,
+          tx_type TEXT NOT NULL, amount NUMERIC(20,8) NOT NULL,
+          network TEXT, reference TEXT, status TEXT NOT NULL DEFAULT 'pending',
+          note TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
+        CREATE UNIQUE INDEX IF NOT EXISTS unique_advertiser_deposit_txid
+          ON advertiser_transactions(LOWER(reference))
+          WHERE tx_type='deposit' AND reference IS NOT NULL;
 
-        # USERS
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id BIGINT PRIMARY KEY,
-                points BIGINT NOT NULL DEFAULT 0,
-                last_ad_at TIMESTAMPTZ,
-                is_banned BOOLEAN NOT NULL DEFAULT FALSE,
-                referred_by BIGINT,
-                referral_paid BOOLEAN NOT NULL DEFAULT FALSE,
-                language TEXT NOT NULL DEFAULT 'en'
-            )
+        CREATE TABLE IF NOT EXISTS campaigns(
+          campaign_id BIGSERIAL PRIMARY KEY, advertiser_id BIGINT NOT NULL,
+          title TEXT NOT NULL, channel_link TEXT NOT NULL,
+          target_members INTEGER NOT NULL, reward_per_join NUMERIC(20,8) NOT NULL,
+          total_budget NUMERIC(20,8) NOT NULL, spent NUMERIC(20,8) NOT NULL DEFAULT 0,
+          verified_joins INTEGER NOT NULL DEFAULT 0,
+          status TEXT NOT NULL DEFAULT 'pending_payment',
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), chat_id TEXT);
+        ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS chat_id TEXT;
+        ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS is_test BOOLEAN NOT NULL DEFAULT FALSE;
+        ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS budget_reserved BOOLEAN NOT NULL DEFAULT TRUE;
+
+        CREATE TABLE IF NOT EXISTS campaign_joins(
+          join_id BIGSERIAL PRIMARY KEY,
+          campaign_id BIGINT NOT NULL REFERENCES campaigns(campaign_id),
+          user_id BIGINT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          UNIQUE(campaign_id,user_id));
+        CREATE TABLE IF NOT EXISTS advertiser_withdrawals(
+          withdrawal_id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL,
+          amount NUMERIC(20,8) NOT NULL, network TEXT NOT NULL,
+          wallet TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
+        ALTER TABLE advertiser_withdrawals ADD COLUMN IF NOT EXISTS txid TEXT;
+        CREATE UNIQUE INDEX IF NOT EXISTS unique_adv_payout_txid
+          ON advertiser_withdrawals(LOWER(txid)) WHERE txid IS NOT NULL;
+
+        CREATE UNIQUE INDEX IF NOT EXISTS unique_open_task_submission
+          ON submissions(user_id,task_id) WHERE status IN ('pending','approved');
         """)
-
-        await conn.execute("""
-            ALTER TABLE users
-            ADD COLUMN IF NOT EXISTS is_banned BOOLEAN NOT NULL DEFAULT FALSE;
-            ALTER TABLE users
-            ADD COLUMN IF NOT EXISTS referred_by BIGINT;
-            ALTER TABLE users
-            ADD COLUMN IF NOT EXISTS referral_paid BOOLEAN NOT NULL DEFAULT FALSE;
-            ALTER TABLE users
-            ADD COLUMN IF NOT EXISTS language TEXT NOT NULL DEFAULT 'en';
+        await c.execute("""
+          INSERT INTO settings(key,value) VALUES
+          ('min_withdraw','5000'),('points_per_usdt','1000'),
+          ('referral_bonus','10'),('adv_min_withdraw','10')
+          ON CONFLICT(key) DO NOTHING
         """)
-
-        # SETTINGS
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )
+        # Keep the minimum at 5 USDT (1,000 points = 1 USDT).
+        await c.execute("""
+          INSERT INTO settings(key,value) VALUES('min_withdraw','5000')
+          ON CONFLICT(key) DO UPDATE SET value =
+            GREATEST(COALESCE(NULLIF(settings.value,'')::BIGINT,5000),5000)::TEXT
         """)
-
-        # TASKS
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS tasks (
-                task_id BIGSERIAL PRIMARY KEY,
-                title TEXT NOT NULL,
-                reward BIGINT NOT NULL,
-                active BOOLEAN NOT NULL DEFAULT TRUE
-            )
+        # Existing test campaigns created by the previous version must never
+        # become real paid campaigns after this migration.
+        await c.execute("""
+          UPDATE campaigns
+          SET is_test=TRUE, budget_reserved=FALSE
+          WHERE title LIKE 'TEST:%'
         """)
-
-        # SUBMISSIONS
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS submissions (
-                submission_id BIGSERIAL PRIMARY KEY,
-                user_id BIGINT NOT NULL,
-                task_id BIGINT NOT NULL,
-                proof TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                created_at TIMESTAMPTZ DEFAULT NOW()
-            )
-        """)
-
-        # USER WITHDRAWALS
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS withdrawals (
-                withdrawal_id BIGSERIAL PRIMARY KEY,
-                user_id BIGINT NOT NULL,
-                amount BIGINT NOT NULL,
-                wallet TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                created_at TIMESTAMPTZ DEFAULT NOW()
-            )
-        """)
-
-        # ADVERTISER WALLETS
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS advertiser_wallets (
-                user_id BIGINT PRIMARY KEY,
-                available NUMERIC(20,8) NOT NULL DEFAULT 0,
-                reserved NUMERIC(20,8) NOT NULL DEFAULT 0,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-        """)
-
-        # ADVERTISER TRANSACTIONS
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS advertiser_transactions (
-                tx_id BIGSERIAL PRIMARY KEY,
-                user_id BIGINT NOT NULL,
-                tx_type TEXT NOT NULL,
-                amount NUMERIC(20,8) NOT NULL,
-                network TEXT,
-                reference TEXT,
-                status TEXT NOT NULL DEFAULT 'pending',
-                note TEXT,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-        """)
-
-        # PREVENT DUPLICATE DEPOSIT TXIDs
-        await conn.execute("""
-            CREATE UNIQUE INDEX IF NOT EXISTS
-            unique_advertiser_deposit_txid
-            ON advertiser_transactions (LOWER(reference))
-            WHERE tx_type = 'deposit'
-            AND reference IS NOT NULL
-        """)
-
-        # CAMPAIGNS
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS campaigns (
-                campaign_id BIGSERIAL PRIMARY KEY,
-                advertiser_id BIGINT NOT NULL,
-                title TEXT NOT NULL,
-                channel_link TEXT NOT NULL,
-                target_members INTEGER NOT NULL,
-                reward_per_join NUMERIC(20,8) NOT NULL,
-                total_budget NUMERIC(20,8) NOT NULL,
-                spent NUMERIC(20,8) NOT NULL DEFAULT 0,
-                verified_joins INTEGER NOT NULL DEFAULT 0,
-                status TEXT NOT NULL DEFAULT 'pending_payment',
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                chat_id TEXT
-            )
-        """)
-
-        # ADD CHAT ID TO EXISTING CAMPAIGNS TABLE
-        await conn.execute("""
-            ALTER TABLE campaigns
-            ADD COLUMN IF NOT EXISTS chat_id TEXT
-        """)
-
-        # CAMPAIGN JOINS
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS campaign_joins (
-                join_id BIGSERIAL PRIMARY KEY,
-                campaign_id BIGINT NOT NULL
-                    REFERENCES campaigns(campaign_id),
-                user_id BIGINT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                UNIQUE(campaign_id, user_id)
-            )
-        """)
-
-        # ADVERTISER WITHDRAWALS
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS advertiser_withdrawals (
-                withdrawal_id BIGSERIAL PRIMARY KEY,
-                user_id BIGINT NOT NULL,
-                amount NUMERIC(20,8) NOT NULL,
-                network TEXT NOT NULL,
-                wallet TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-        """)
-
-    print("PostgreSQL connected successfully!")
-
+    print("PostgreSQL connected")
 
 
 async def get_setting(key, default):
-    async with db_pool.acquire() as conn:
-        value = await conn.fetchval("SELECT value FROM settings WHERE key = $1", key)
+    async with db_pool.acquire() as c:
+        value = await c.fetchval("SELECT value FROM settings WHERE key=$1", key)
     if value is None:
         return default
     try:
@@ -231,1935 +188,897 @@ async def get_setting(key, default):
 
 
 async def set_setting(key, value):
-    async with db_pool.acquire() as conn:
-        await conn.execute("""
-            INSERT INTO settings (key, value) VALUES ($1, $2)
-            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+    async with db_pool.acquire() as c:
+        await c.execute("""
+          INSERT INTO settings(key,value) VALUES($1,$2)
+          ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value
         """, key, str(value))
 
 
-async def register_user(user_id, referred_by=None):
-    async with db_pool.acquire() as conn:
-        async with conn.transaction():
-            inserted = await conn.fetchval("""
-                INSERT INTO users (user_id, referred_by)
-                VALUES ($1, $2)
-                ON CONFLICT (user_id) DO NOTHING
-                RETURNING user_id
-            """, user_id, referred_by)
+async def register_user(uid, ref=None):
+    async with db_pool.acquire() as c:
+        async with c.transaction():
+            inserted = await c.fetchval("""
+              INSERT INTO users(user_id,referred_by) VALUES($1,$2)
+              ON CONFLICT(user_id) DO NOTHING RETURNING user_id
+            """, uid, ref if ref != uid else None)
             if inserted:
-                await conn.execute(
-                    "INSERT INTO advertiser_wallets (user_id) VALUES ($1) ON CONFLICT DO NOTHING",
-                    user_id
-                )
-                if referred_by and referred_by != user_id:
-                    referrer = await conn.fetchval(
-                        "SELECT user_id FROM users WHERE user_id = $1", referred_by
-                    )
-                    if referrer:
-                        bonus = await get_setting("referral_bonus", REFERRAL_BONUS)
-                        await conn.execute(
-                            "UPDATE users SET points = points + $1 WHERE user_id = $2",
-                            bonus, referred_by
-                        )
-                        await conn.execute(
-                            "UPDATE users SET referral_paid = TRUE WHERE user_id = $1",
-                            user_id
-                        )
+                await c.execute(
+                    "INSERT INTO advertiser_wallets(user_id) VALUES($1) ON CONFLICT DO NOTHING", uid)
+                if ref and ref != uid:
+                    bonus = int(await c.fetchval(
+                        "SELECT value FROM settings WHERE key='referral_bonus'") or REFERRAL_BONUS)
+                    valid = await c.fetchval("SELECT user_id FROM users WHERE user_id=$1", ref)
+                    if valid:
+                        await c.execute("UPDATE users SET points=points+$1 WHERE user_id=$2", bonus, ref)
+                        await c.execute("UPDATE users SET referral_paid=TRUE WHERE user_id=$1", uid)
 
 
-async def get_user(user_id):
-    async with db_pool.acquire() as conn:
-        return await conn.fetchrow("""
-            SELECT points, last_ad_at, is_banned, language
-            FROM users WHERE user_id = $1
-        """, user_id)
+async def get_user(uid):
+    async with db_pool.acquire() as c:
+        return await c.fetchrow(
+            "SELECT points,last_ad_at,is_banned,language FROM users WHERE user_id=$1", uid)
 
 
-async def is_admin(user_id):
-    return user_id in ADMIN_IDS
+async def is_admin(uid):
+    return uid in ADMIN_IDS
 
 
 async def allowed(message):
     if await is_admin(message.from_user.id):
         return True
     user = await get_user(message.from_user.id)
+    if not user:
+        await register_user(message.from_user.id)
+        user = await get_user(message.from_user.id)
     if user and user["is_banned"]:
         await message.answer("⛔ Your account is banned.")
         return False
     return True
 
 
+async def ensure_wallet(uid):
+    async with db_pool.acquire() as c:
+        await c.execute("INSERT INTO advertiser_wallets(user_id) VALUES($1) ON CONFLICT DO NOTHING", uid)
+        return await c.fetchrow(
+            "SELECT available,reserved FROM advertiser_wallets WHERE user_id=$1", uid)
 
 
 async def verify_deposit_on_blockchain(network, txid, amount):
     txid = txid.strip()
-
-    if network == "BEP20" and txid.lower().startswith("0x"):
-        txid = txid[2:]
-
-    if len(txid) != 64 or any(c not in "0123456789abcdefABCDEF" for c in txid):
+    raw = txid[2:] if txid.lower().startswith("0x") else txid
+    if not valid_txid(txid):
         return False
-
     if network == "TRC20":
-        address = await get_setting(
-            "deposit_address_TRC20", USDT_TRC20_ADDRESS
-        )
+        address = await get_setting("deposit_address_TRC20", USDT_TRC20_ADDRESS)
         api_key = os.getenv("TRONGRID_API_KEY", "")
-
         if not address or not api_key:
-            raise RuntimeError("TRON address or API key missing")
-
-        expected = amount * Decimal(10 ** 6)
-        if expected != expected.to_integral_value():
-            return False
-
-
-        
+            raise RuntimeError("TRON deposit address or TRONGRID_API_KEY is not configured")
+        expected = int(amount * Decimal(10**6))
         url = f"https://api.trongrid.io/v1/accounts/{address}/transactions/trc20"
-        params = {
-            "only_confirmed": "true",
-            "only_to": "true",
-            "limit": 200,
-            "contract_address": "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t",
-            "order_by": "block_timestamp,desc"
-        }
-        headers = {"TRON-PRO-API-KEY": api_key}
-
-        async with aiohttp.ClientSession() as session:
+        params = {"only_confirmed":"true","only_to":"true","limit":200,
+                  "contract_address":TRON_USDT_CONTRACT,"order_by":"block_timestamp,desc"}
+        headers = {"TRON-PRO-API-KEY":api_key}
+        async with aiohttp.ClientSession() as s:
             for _ in range(20):
-                async with session.get(
-                    url, params=params, headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=25)
-                ) as response:
-                    response.raise_for_status()
-                    result = await response.json()
-
-                for item in result.get("data", []):
-                    if (
-                        item.get("transaction_id", "").lower() == txid.lower()
-                        and item.get("to") == address
-                        and item.get("token_info", {}).get("address")
-                        == "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
-                        and int(item.get("value", "0")) == int(expected)
-                    ):
+                async with s.get(url,params=params,headers=headers,
+                                 timeout=aiohttp.ClientTimeout(total=25)) as r:
+                    r.raise_for_status()
+                    data = await r.json()
+                for item in data.get("data",[]):
+                    if (item.get("transaction_id","").lower()==raw.lower()
+                        and item.get("to")==address
+                        and item.get("token_info",{}).get("address")==TRON_USDT_CONTRACT
+                        and int(item.get("value","0"))==expected):
                         return True
-
-                fingerprint = result.get("meta", {}).get("fingerprint")
-                if not fingerprint:
-                    break
-                params["fingerprint"] = fingerprint
-
+                fp = data.get("meta",{}).get("fingerprint")
+                if not fp: break
+                params["fingerprint"] = fp
         return False
-
-    elif network == "BEP20":
-        address = await get_setting(
-            "deposit_address_BEP20", USDT_BEP20_ADDRESS
-        )
-
-        if not address or not address.startswith("0x") or len(address) != 42:
-            raise RuntimeError("Invalid BEP20 deposit address")
-
-        expected = amount * Decimal(10 ** 18)
-        if expected != expected.to_integral_value():
-            return False
-
-        token = "0x55d398326f99059fF775485246999027B3197955"
-        transfer_topic = (
-            "0xddf252ad1be2c89b69c2b068fc378daa"
-            "952ba7f163c4a11628f55a4df523b3ef"
-        )
-
-        async with aiohttp.ClientSession() as session:
+    if network == "BEP20":
+        address = await get_setting("deposit_address_BEP20", USDT_BEP20_ADDRESS)
+        if not valid_wallet("BEP20", address or ""):
+            raise RuntimeError("BEP20 deposit address is not configured correctly")
+        expected = int(amount * Decimal(10**18))
+        async with aiohttp.ClientSession() as s:
             async def rpc(method, params):
-                async with session.post(
-                    "https://bsc-dataseed.binance.org/",
-                    json={
-                        "jsonrpc": "2.0",
-                        "id": 1,
-                        "method": method,
-                        "params": params
-                    },
-                    timeout=aiohttp.ClientTimeout(total=25)
-                ) as response:
-                    response.raise_for_status()
-                    data = await response.json()
-
-                if "error" in data or "result" not in data:
+                async with s.post("https://bsc-dataseed.binance.org/",
+                    json={"jsonrpc":"2.0","id":1,"method":method,"params":params},
+                    timeout=aiohttp.ClientTimeout(total=25)) as r:
+                    r.raise_for_status()
+                    data = await r.json()
+                if data.get("error") or "result" not in data:
                     raise RuntimeError("BSC RPC verification failed")
                 return data["result"]
-
-            chain_id = await rpc("eth_chainId", [])
-            if chain_id != "0x38":
-                return False
-
-            receipt = await rpc(
-                "eth_getTransactionReceipt", ["0x" + txid]
-            )
-
-            if not receipt or receipt.get("status") != "0x1":
-                return False
-
-            latest = await rpc("eth_blockNumber", [])
-            confirmations = (
-                int(latest, 16) - int(receipt["blockNumber"], 16)
-            )
-
-            if confirmations < 12:
-                return False
-
-            for log in receipt.get("logs", []):
-                topics = log.get("topics", [])
-
-                if (
-                    log.get("address", "").lower() == token.lower()
-                    and len(topics) >= 3
-                    and topics[0].lower() == transfer_topic
-                    and topics[2][-40:].lower() == address[2:].lower()
-                    and int(log.get("data", "0x0"), 16) == int(expected)
-                ):
+            if await rpc("eth_chainId",[]) != "0x38": return False
+            receipt = await rpc("eth_getTransactionReceipt",["0x"+raw])
+            if not receipt or receipt.get("status")!="0x1": return False
+            latest = await rpc("eth_blockNumber",[])
+            if int(latest,16)-int(receipt["blockNumber"],16)+1 < 12: return False
+            for log in receipt.get("logs",[]):
+                topics=log.get("topics",[])
+                if (log.get("address","").lower()==BSC_USDT_CONTRACT.lower()
+                    and len(topics)>=3 and topics[0].lower()==TRANSFER_TOPIC
+                    and topics[2][-40:].lower()==address[2:].lower()
+                    and int(log.get("data","0x0"),16)==expected):
                     return True
-
         return False
-
     return False
 
 
-
-async def ensure_wallet(user_id):
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO advertiser_wallets (user_id) VALUES ($1) ON CONFLICT DO NOTHING",
-            user_id
-        )
-        return await conn.fetchrow(
-            "SELECT available, reserved FROM advertiser_wallets WHERE user_id = $1",
-            user_id
-        )
-
-
-# ---------------- START / LANGUAGE ----------------
-
+# START / LANGUAGE
 @dp.message(CommandStart())
 async def start(message: Message):
-    user_id = message.from_user.id
-    args = (message.text or "").split()
-    referred_by = None
-    if len(args) > 1 and args[1].startswith("ref_"):
-        try:
-            referred_by = int(args[1][4:])
-        except ValueError:
-            pass
-    await register_user(user_id, referred_by)
-    if not await allowed(message):
-        return
-    await message.answer(
-        "Welcome to EarnWave! 🌍\n\n"
-        "Earn points by completing available tasks. Advertisers can promote their channels.\n\n"
-        "Use 🌐 Language to choose your language.",
-        reply_markup=keyboard
-    )
+    args=(message.text or "").split()
+    ref=None
+    if len(args)>1 and args[1].startswith("ref_"):
+        try: ref=int(args[1][4:])
+        except ValueError: pass
+    await register_user(message.from_user.id,ref)
+    if await allowed(message):
+        await message.answer(
+            "Welcome to EarnWave! 🌍\nEarn points through available tasks and verified campaigns.\n"
+            "Use 🌐 Language to choose your language.", reply_markup=keyboard)
 
 
-@dp.message(lambda m: m.text == "🌐 Language")
+@dp.message(lambda m:m.text=="🌐 Language")
 async def language_menu(message: Message):
-    if not await allowed(message):
-        return
-    await message.answer(
-        "Choose language:\n"
-        "/lang en - English\n"
-        "/lang bn - বাংলা\n"
-        "/lang hi - हिन्दी\n"
-        "/lang ur - اردو\n"
-        "/lang ar - العربية\n"
-        "/lang es - Español\n"
-        "/lang fr - Français"
-    )
+    if await allowed(message):
+        await message.answer("Choose: /lang en | /lang bn | /lang hi | /lang ur | /lang ar | /lang es | /lang fr")
 
 
 @dp.message(Command("lang"))
 async def set_language(message: Message):
-    if not await allowed(message):
-        return
-    parts = (message.text or "").split()
-    if len(parts) != 2 or parts[1] not in {"en", "bn", "hi", "ur", "ar", "es", "fr"}:
-        await message.answer("Use: /lang en|bn|hi|ur|ar|es|fr")
-        return
-    async with db_pool.acquire() as conn:
-        await conn.execute("UPDATE users SET language = $1 WHERE user_id = $2",
-                           parts[1], message.from_user.id)
-    await message.answer("✅ Language preference saved. Some messages are currently English while translations are being completed.")
+    if not await allowed(message): return
+    p=(message.text or "").split()
+    if len(p)!=2 or p[1] not in {"en","bn","hi","ur","ar","es","fr"}:
+        await message.answer("Use: /lang en|bn|hi|ur|ar|es|fr"); return
+    async with db_pool.acquire() as c:
+        await c.execute("UPDATE users SET language=$1 WHERE user_id=$2",p[1],message.from_user.id)
+    await message.answer("✅ Language preference saved. Some messages remain in English.")
 
 
-# ---------------- ADMIN PANEL ----------------
-
+# ADMIN
 @dp.message(Command("admin"))
 async def admin_panel(message: Message):
-    if not await is_admin(message.from_user.id):
-        await message.answer("⛔ Not authorized.")
-        return
-    async with db_pool.acquire() as conn:
-        total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
-        total_points = await conn.fetchval("SELECT COALESCE(SUM(points), 0) FROM users")
-        pending_campaigns = await conn.fetchval("SELECT COUNT(*) FROM campaigns WHERE status = 'pending_payment'")
-        pending_deposits = await conn.fetchval("SELECT COUNT(*) FROM advertiser_transactions WHERE tx_type = 'deposit' AND status = 'pending'")
-        available_wallets = await conn.fetchval("SELECT COALESCE(SUM(available), 0) FROM advertiser_wallets")
-    reward = await get_setting("ad_reward", REWARD_POINTS)
-    minimum = await get_setting("min_withdraw", MIN_WITHDRAWAL)
-    await message.answer(
-        "🛠 EARNWAVE ADMIN PANEL\n\n"
-        f"👥 Users: {total_users}\n💰 User Points: {total_points}\n"
-        f"🎬 Test Ad Reward: {reward}\n💳 Minimum User Withdrawal: {minimum}\n"
-        f"📢 Pending Campaigns: {pending_campaigns}\n"
-        f"💵 Pending Deposits: {pending_deposits}\n"
-        f"👛 Advertiser Available Wallets: {available_wallets} USDT\n\n"
-        "Use /helpadmin for commands."
-    )
+    if not await is_admin(message.from_user.id): return
+    async with db_pool.acquire() as c:
+        users=await c.fetchval("SELECT COUNT(*) FROM users")
+        points=await c.fetchval("SELECT COALESCE(SUM(points),0) FROM users")
+        camps=await c.fetchval("SELECT COUNT(*) FROM campaigns WHERE status='pending_payment'")
+        deposits=await c.fetchval("SELECT COUNT(*) FROM advertiser_transactions WHERE tx_type='deposit' AND status='pending'")
+        funds=await c.fetchval("SELECT COALESCE(SUM(available),0) FROM advertiser_wallets")
+    await message.answer(f"🛠 EARNWAVE ADMIN\nUsers: {users}\nUser points: {points}\nMinimum withdrawal: {await get_setting('min_withdraw',MIN_WITHDRAWAL)}\nPending campaigns: {camps}\nPending deposits: {deposits}\nAdvertiser available: {funds} USDT\n/helpadmin")
 
 
 @dp.message(Command("helpadmin"))
-async def admin_help(message: Message):
-    if not await is_admin(message.from_user.id):
-        return
+async def helpadmin(message: Message):
+    if not await is_admin(message.from_user.id): return
     await message.answer(
-        "🛠 ADMIN COMMANDS\n\n"
-        "/users\n/addpoints ID AMOUNT\n/removepoints ID AMOUNT\n/ban ID\n/unban ID\n"
-        "/addtask REWARD | TASK NAME\n/tasklist\n/deltask TASK_ID\n"
-        "/submissions\n/approve SUBMISSION_ID\n/reject SUBMISSION_ID\n"
-        "/withdrawals\n/approvewithdraw ID\n/rejectwithdraw ID\n"
-        "/broadcast MESSAGE\n/setadreward AMOUNT\n/setminwithdraw AMOUNT\n/setrefbonus AMOUNT\n"
-        "/referral\n\n"
-        "ADVERTISER:\n/deposits - pending deposit requests\n/approvedeposit TX_ID\n/rejectdeposit TX_ID\n"
-        "/campaigns - pending campaigns\n/approvecampaign ID\n/rejectcampaign ID\n"
-        "/approvejoin CAMPAIGN_ID USER_ID\n/rejectjoin CAMPAIGN_ID USER_ID\n"
-        "/advertiserwithdrawals\n/approveadvwithdraw ID\n/rejectadvwithdraw ID\n"
-        "/setdepositaddress NETWORK ADDRESS\n"
-        "/setadvminwithdraw AMOUNT"
-    )
+      "ADMIN:\n/users /addpoints ID AMOUNT /removepoints ID AMOUNT /ban ID /unban ID\n"
+      "/addtask REWARD | TITLE /tasklist /deltask ID /submissions /approve ID /reject ID\n"
+      "/withdrawals [pending|approved|paid|rejected] /approvewithdraw ID /rejectwithdraw ID /markpaid ID TXID\n"
+      "/broadcast TEXT /setminwithdraw POINTS /setrefbonus POINTS\n"
+      "ADVERTISER:\n/deposits /approvedeposit TX_ID /rejectdeposit TX_ID\n"
+      "/campaigns /approvecampaign ID /rejectcampaign ID\n"
+      "/advertiserwithdrawals /approveadvwithdraw ID /markadvpaid ID TXID /rejectadvwithdraw ID\n"
+      "/setdepositaddress NETWORK ADDRESS /setadvminwithdraw AMOUNT /setpointsrate RATE")
 
-
-# ---------------- USER MANAGEMENT ----------------
 
 @dp.message(Command("users"))
 async def admin_users(message: Message):
-    if not await is_admin(message.from_user.id):
-        return
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch("SELECT user_id, points, is_banned FROM users ORDER BY points DESC LIMIT 20")
-    if not rows:
-        await message.answer("No users found.")
-        return
-    out = "👥 USER LIST\n\n"
-    for row in rows:
-        out += f"ID: {row['user_id']} | Points: {row['points']} | {'BANNED' if row['is_banned'] else 'ACTIVE'}\n"
-    await message.answer(out)
+    if not await is_admin(message.from_user.id): return
+    async with db_pool.acquire() as c:
+        rows=await c.fetch("SELECT user_id,points,is_banned FROM users ORDER BY points DESC LIMIT 20")
+    await message.answer("👥 USERS\n"+"\n".join(
+        f"{r['user_id']} | {r['points']} | {'BANNED' if r['is_banned'] else 'ACTIVE'}" for r in rows) if rows else "No users.")
 
 
 @dp.message(Command("addpoints"))
 async def add_points(message: Message):
-    if not await is_admin(message.from_user.id):
-        return
+    if not await is_admin(message.from_user.id): return
     try:
-        _, uid, amount = message.text.split()
-        uid, amount = int(uid), int(amount)
-        if amount <= 0:
-            raise ValueError
-        async with db_pool.acquire() as conn:
-            result = await conn.execute("UPDATE users SET points = points + $1 WHERE user_id = $2", amount, uid)
-        await message.answer("User not found." if result == "UPDATE 0" else f"✅ Added {amount} points to {uid}.")
-    except (ValueError, TypeError):
-        await message.answer("Use: /addpoints USER_ID AMOUNT")
+        _,u,a=message.text.split(); u=int(u); a=int(a)
+        if a<=0: raise ValueError
+        async with db_pool.acquire() as c: res=await c.execute("UPDATE users SET points=points+$1 WHERE user_id=$2",a,u)
+        await message.answer("User not found." if res=="UPDATE 0" else f"Added {a} points.")
+    except (ValueError,AttributeError): await message.answer("Use: /addpoints ID AMOUNT")
 
 
 @dp.message(Command("removepoints"))
 async def remove_points(message: Message):
-    if not await is_admin(message.from_user.id):
-        return
+    if not await is_admin(message.from_user.id): return
     try:
-        _, uid, amount = message.text.split()
-        uid, amount = int(uid), int(amount)
-        if amount <= 0:
-            raise ValueError
-        async with db_pool.acquire() as conn:
-            result = await conn.execute("UPDATE users SET points = GREATEST(points - $1, 0) WHERE user_id = $2", amount, uid)
-        await message.answer("User not found." if result == "UPDATE 0" else f"✅ Removed {amount} points from {uid}.")
-    except (ValueError, TypeError):
-        await message.answer("Use: /removepoints USER_ID AMOUNT")
+        _,u,a=message.text.split(); u=int(u); a=int(a)
+        if a<=0: raise ValueError
+        async with db_pool.acquire() as c: res=await c.execute("UPDATE users SET points=GREATEST(points-$1,0) WHERE user_id=$2",a,u)
+        await message.answer("User not found." if res=="UPDATE 0" else f"Removed up to {a} points.")
+    except (ValueError,AttributeError): await message.answer("Use: /removepoints ID AMOUNT")
 
 
 @dp.message(Command("ban"))
 async def ban_user(message: Message):
-    if not await is_admin(message.from_user.id):
-        return
+    if not await is_admin(message.from_user.id): return
     try:
-        uid = int(message.text.split()[1])
-        async with db_pool.acquire() as conn:
-            result = await conn.execute("UPDATE users SET is_banned = TRUE WHERE user_id = $1", uid)
-        if result == "UPDATE 0":
-            await message.answer("User not found.")
-        else:
-            await message.answer(f"🚫 User {uid} banned.")
-            try:
-                await bot.send_message(uid, "⛔ Your account has been banned.")
-            except Exception:
-                pass
-    except (ValueError, IndexError):
-        await message.answer("Use: /ban USER_ID")
+        uid=int(message.text.split()[1])
+        async with db_pool.acquire() as c: res=await c.execute("UPDATE users SET is_banned=TRUE WHERE user_id=$1",uid)
+        await message.answer("User not found." if res=="UPDATE 0" else f"User {uid} banned.")
+    except (ValueError,IndexError): await message.answer("Use: /ban ID")
 
 
 @dp.message(Command("unban"))
 async def unban_user(message: Message):
-    if not await is_admin(message.from_user.id):
-        return
+    if not await is_admin(message.from_user.id): return
     try:
-        uid = int(message.text.split()[1])
-        async with db_pool.acquire() as conn:
-            result = await conn.execute("UPDATE users SET is_banned = FALSE WHERE user_id = $1", uid)
-        await message.answer("User not found." if result == "UPDATE 0" else f"✅ User {uid} unbanned.")
-    except (ValueError, IndexError):
-        await message.answer("Use: /unban USER_ID")
+        uid=int(message.text.split()[1])
+        async with db_pool.acquire() as c: res=await c.execute("UPDATE users SET is_banned=FALSE WHERE user_id=$1",uid)
+        await message.answer("User not found." if res=="UPDATE 0" else f"User {uid} unbanned.")
+    except (ValueError,IndexError): await message.answer("Use: /unban ID")
 
 
-# ---------------- TASKS / SUBMISSIONS ----------------
-
+# TASKS
 @dp.message(Command("addtask"))
 async def add_task(message: Message):
-    if not await is_admin(message.from_user.id):
-        return
+    if not await is_admin(message.from_user.id): return
     try:
-        data = message.text.split(maxsplit=1)[1]
-        reward_text, title = data.split("|", 1)
-        reward, title = int(reward_text.strip()), title.strip()
-        if reward <= 0 or not title:
-            raise ValueError
-        async with db_pool.acquire() as conn:
-            tid = await conn.fetchval("INSERT INTO tasks (title, reward) VALUES ($1, $2) RETURNING task_id", title, reward)
-        await message.answer(f"✅ Task added!\nID: {tid}\nReward: {reward}\nTitle: {title}")
-    except (ValueError, IndexError):
-        await message.answer("Use: /addtask 50 | Join our Telegram channel")
+        raw=message.text.split(maxsplit=1)[1]; reward,title=raw.split("|",1)
+        reward=int(reward.strip()); title=title.strip()
+        if reward<=0 or not title: raise ValueError
+        async with db_pool.acquire() as c: tid=await c.fetchval("INSERT INTO tasks(title,reward) VALUES($1,$2) RETURNING task_id",title,reward)
+        await message.answer(f"Task #{tid} added.")
+    except (ValueError,IndexError): await message.answer("Use: /addtask 50 | Task title")
 
 
 @dp.message(Command("tasklist"))
 async def task_list(message: Message):
-    if not await is_admin(message.from_user.id):
-        return
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch("SELECT task_id, title, reward, active FROM tasks ORDER BY task_id DESC")
-    if not rows:
-        await message.answer("No tasks available.")
-        return
-    out = "📋 TASK LIST\n\n"
-    for r in rows:
-        out += f"ID: {r['task_id']}\n{r['title']}\nReward: {r['reward']} | {'Active' if r['active'] else 'Deleted'}\n\n"
-    await message.answer(out)
+    if not await is_admin(message.from_user.id): return
+    async with db_pool.acquire() as c: rows=await c.fetch("SELECT task_id,title,reward,active FROM tasks ORDER BY task_id DESC")
+    await message.answer("\n\n".join(f"#{r['task_id']} {r['title']} | {r['reward']} points | {'Active' if r['active'] else 'Deleted'}" for r in rows) or "No tasks.")
 
 
 @dp.message(Command("deltask"))
 async def delete_task(message: Message):
-    if not await is_admin(message.from_user.id):
-        return
+    if not await is_admin(message.from_user.id): return
     try:
-        tid = int(message.text.split()[1])
-        async with db_pool.acquire() as conn:
-            result = await conn.execute("UPDATE tasks SET active = FALSE WHERE task_id = $1", tid)
-        await message.answer("Task not found." if result == "UPDATE 0" else f"🗑 Task {tid} deleted.")
-    except (ValueError, IndexError):
-        await message.answer("Use: /deltask TASK_ID")
+        tid=int(message.text.split()[1])
+        async with db_pool.acquire() as c: res=await c.execute("UPDATE tasks SET active=FALSE WHERE task_id=$1",tid)
+        await message.answer("Task not found." if res=="UPDATE 0" else "Task deactivated.")
+    except (ValueError,IndexError): await message.answer("Use: /deltask ID")
 
 
 @dp.message(Command("submit"))
 async def submit_task(message: Message):
-    if not await allowed(message):
-        return
+    if not await allowed(message): return
     try:
-        _, tid, proof = message.text.split(maxsplit=2)
-        tid = int(tid)
-        async with db_pool.acquire() as conn:
-            task = await conn.fetchval("SELECT task_id FROM tasks WHERE task_id = $1 AND active = TRUE", tid)
-            if not task:
-                await message.answer("Task not found or inactive.")
-                return
-            existing = await conn.fetchval("""
-                SELECT submission_id FROM submissions
-                WHERE user_id = $1 AND task_id = $2 AND status IN ('pending', 'approved')
-            """, message.from_user.id, tid)
-            if existing:
-                await message.answer("You already submitted this task.")
-                return
-            sid = await conn.fetchval("""
-                INSERT INTO submissions (user_id, task_id, proof) VALUES ($1, $2, $3) RETURNING submission_id
-            """, message.from_user.id, tid, proof)
-        await message.answer(f"✅ Submission received!\nSubmission ID: {sid}")
-    except (ValueError, IndexError):
-        await message.answer("Use: /submit TASK_ID YOUR_PROOF")
+        _,tid,proof=message.text.split(maxsplit=2); tid=int(tid)
+        async with db_pool.acquire() as c:
+            exists=await c.fetchval("SELECT 1 FROM tasks WHERE task_id=$1 AND active=TRUE",tid)
+            if not exists: await message.answer("Task not found."); return
+            sid=await c.fetchval("""INSERT INTO submissions(user_id,task_id,proof) VALUES($1,$2,$3)
+              ON CONFLICT(user_id,task_id) WHERE status IN ('pending','approved') DO NOTHING RETURNING submission_id""",
+              message.from_user.id,tid,proof)
+        await message.answer(f"Submission received: #{sid}" if sid else "You already submitted this task.")
+    except (ValueError,IndexError): await message.answer("Use: /submit TASK_ID PROOF")
 
 
 @dp.message(Command("submissions"))
-async def pending_submissions(message: Message):
-    if not await is_admin(message.from_user.id):
-        return
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch("SELECT submission_id, user_id, task_id, proof FROM submissions WHERE status = 'pending' ORDER BY submission_id DESC LIMIT 20")
-    if not rows:
-        await message.answer("No pending submissions.")
-        return
-    out = "📨 PENDING SUBMISSIONS\n\n"
-    for r in rows:
-        out += f"Submission: {r['submission_id']}\nUser: {r['user_id']}\nTask: {r['task_id']}\nProof: {r['proof'][:250]}\n\n"
-    await message.answer(out)
+async def submissions(message: Message):
+    if not await is_admin(message.from_user.id): return
+    async with db_pool.acquire() as c:
+        rows=await c.fetch("SELECT submission_id,user_id,task_id,proof FROM submissions WHERE status='pending' ORDER BY submission_id DESC LIMIT 20")
+    await message.answer("\n\n".join(f"#{r['submission_id']} user {r['user_id']} task {r['task_id']}\n{r['proof'][:200]}" for r in rows) or "No pending submissions.")
 
 
 @dp.message(Command("approve"))
 async def approve_submission(message: Message):
-    if not await is_admin(message.from_user.id):
-        return
+    if not await is_admin(message.from_user.id): return
     try:
-        sid = int(message.text.split()[1])
-        async with db_pool.acquire() as conn:
-            async with conn.transaction():
-                row = await conn.fetchrow("""
-                    SELECT s.user_id, t.reward FROM submissions s
-                    JOIN tasks t ON t.task_id = s.task_id
-                    WHERE s.submission_id = $1 AND s.status = 'pending'
-                    FOR UPDATE OF s
-                """, sid)
-                if not row:
-                    await message.answer("Pending submission not found.")
-                    return
-                await conn.execute("UPDATE submissions SET status = 'approved' WHERE submission_id = $1", sid)
-                await conn.execute("UPDATE users SET points = points + $1 WHERE user_id = $2", row["reward"], row["user_id"])
-        await message.answer("✅ Submission approved and reward added.")
-        try:
-            await bot.send_message(row["user_id"], f"🎉 Your task was approved! +{row['reward']} points.")
-        except Exception:
-            pass
-    except (ValueError, IndexError):
-        await message.answer("Use: /approve SUBMISSION_ID")
+        sid=int(message.text.split()[1])
+        async with db_pool.acquire() as c:
+            async with c.transaction():
+                r=await c.fetchrow("""SELECT s.user_id,t.reward FROM submissions s JOIN tasks t USING(task_id)
+                  WHERE s.submission_id=$1 AND s.status='pending' FOR UPDATE OF s""",sid)
+                if r:
+                    await c.execute("UPDATE submissions SET status='approved' WHERE submission_id=$1",sid)
+                    await c.execute("UPDATE users SET points=points+$1 WHERE user_id=$2",r["reward"],r["user_id"])
+        if not r: await message.answer("Pending submission not found."); return
+        await message.answer("Approved and points credited.")
+        try: await bot.send_message(r["user_id"],f"Task approved: +{r['reward']} points.")
+        except Exception: pass
+    except (ValueError,IndexError): await message.answer("Use: /approve ID")
 
 
 @dp.message(Command("reject"))
 async def reject_submission(message: Message):
-    if not await is_admin(message.from_user.id):
-        return
+    if not await is_admin(message.from_user.id): return
     try:
-        sid = int(message.text.split()[1])
-        async with db_pool.acquire() as conn:
-            row = await conn.fetchrow("""
-                UPDATE submissions SET status = 'rejected'
-                WHERE submission_id = $1 AND status = 'pending' RETURNING user_id
-            """, sid)
-        if not row:
-            await message.answer("Pending submission not found.")
-            return
-        await message.answer("❌ Submission rejected.")
-        try:
-            await bot.send_message(row["user_id"], "Your task submission was rejected.")
-        except Exception:
-            pass
-    except (ValueError, IndexError):
-        await message.answer("Use: /reject SUBMISSION_ID")
+        sid=int(message.text.split()[1])
+        async with db_pool.acquire() as c:
+            r=await c.fetchrow("UPDATE submissions SET status='rejected' WHERE submission_id=$1 AND status='pending' RETURNING user_id",sid)
+        await message.answer("Rejected." if r else "Pending submission not found.")
+        if r:
+            try: await bot.send_message(r["user_id"],"Your task submission was rejected.")
+            except Exception: pass
+    except (ValueError,IndexError): await message.answer("Use: /reject ID")
 
 
-# ---------------- USER WITHDRAWALS ----------------
-
-
+# USER WITHDRAWALS
 @dp.message(Command("withdraw"))
 async def create_withdrawal(message: Message):
-    if not await allowed(message):
-        return
-
+    if not await allowed(message): return
     try:
-        _, amount_text, network, wallet = message.text.split(maxsplit=3)
-        amount = int(amount_text)
-        network = network.upper().strip()
-        wallet = wallet.strip()
-
-        if network not in ("TRC20", "BEP20"):
-            await message.answer("Network must be TRC20 or BEP20.")
-            return
-
-        uid = message.from_user.id
-        minimum = await get_setting("min_withdraw", MIN_WITHDRAWAL)
-
-        if amount < minimum or amount <= 0:
-            await message.answer(
-                f"Minimum withdrawal is {minimum} points ($5 USDT)."
-            )
-            return
-
-        async with db_pool.acquire() as conn:
-            async with conn.transaction():
-                user = await conn.fetchrow(
-                    "SELECT points FROM users WHERE user_id = $1 FOR UPDATE",
-                    uid
-                )
-
-                if not user or user["points"] < amount:
-                    await message.answer("Insufficient points.")
-                    return
-
-                await conn.execute(
-                    "UPDATE users SET points = points - $1 WHERE user_id = $2",
-                    amount, uid
-                )
-
-                wid = await conn.fetchval("""
-                    INSERT INTO withdrawals (user_id, amount, wallet)
-                    VALUES ($1, $2, $3)
-                    RETURNING withdrawal_id
-                """, uid, amount, f"{network}|{wallet}")
-
-        await message.answer(
-            f"✅ Withdrawal request submitted!\n"
-            f"Request ID: {wid}\n"
-            f"Amount: {amount} points (${amount / 1000:.2f} USDT)\n"
-            f"Network: {network}\n"
-            f"Points reserved pending review."
-        )
-
-    except (ValueError, IndexError):
-        await message.answer(
-            "Use:\n/withdraw AMOUNT TRC20 YOUR_WALLET\n"
-            "or\n/withdraw AMOUNT BEP20 YOUR_WALLET"
-        )
-
+        _,amount_text,network,wallet=message.text.split(maxsplit=3)
+        amount=int(amount_text); network=network.upper()
+        if amount<=0 or network not in {"TRC20","BEP20"} or not valid_wallet(network,wallet):
+            raise ValueError
+        minimum=int(await get_setting("min_withdraw",MIN_WITHDRAWAL))
+        if minimum < 5000:
+            minimum=5000
+        if amount<minimum:
+            await message.answer(f"Minimum withdrawal is {minimum} points (${minimum/1000:.2f} USDT)."); return
+        uid=message.from_user.id
+        async with db_pool.acquire() as c:
+            async with c.transaction():
+                user=await c.fetchrow("SELECT points FROM users WHERE user_id=$1 FOR UPDATE",uid)
+                if not user or user["points"]<amount:
+                    await message.answer("Insufficient points."); return
+                await c.execute("UPDATE users SET points=points-$1 WHERE user_id=$2",amount,uid)
+                wid=await c.fetchval("INSERT INTO withdrawals(user_id,amount,wallet) VALUES($1,$2,$3) RETURNING withdrawal_id",uid,amount,f"{network}|{wallet}")
+        await message.answer(f"Withdrawal request #{wid} submitted.\n{amount} points = ${amount/1000:.2f} USDT.\nAdmin processes payment manually.")
+    except (ValueError,IndexError): await message.answer("Use: /withdraw AMOUNT TRC20|BEP20 WALLET_ADDRESS")
 
 
 @dp.message(Command("withdrawals"))
 async def pending_withdrawals(message: Message):
-    if not await is_admin(message.from_user.id):
-        return
-
-    try:
-        parts = message.text.split(maxsplit=1)
-
-        status_filter = "all"
-        if len(parts) > 1:
-            status_filter = parts[1].lower()
-
-        allowed_statuses = (
-            "all", "pending", "approved", "paid", "rejected"
-        )
-
-        if status_filter not in allowed_statuses:
-            await message.answer(
-                "Use:\n"
-                "/withdrawals\n"
-                "/withdrawals pending\n"
-                "/withdrawals approved\n"
-                "/withdrawals paid\n"
-                "/withdrawals rejected"
-            )
-            return
-
-        async with db_pool.acquire() as conn:
-            if status_filter == "all":
-                rows = await conn.fetch("""
-                    SELECT withdrawal_id, user_id, amount,
-                           wallet, status, txid
-                    FROM withdrawals
-                    ORDER BY withdrawal_id DESC
-                    LIMIT 30
-                """)
-            else:
-                rows = await conn.fetch("""
-                    SELECT withdrawal_id, user_id, amount,
-                           wallet, status, txid
-                    FROM withdrawals
-                    WHERE status = $1
-                    ORDER BY withdrawal_id DESC
-                    LIMIT 30
-                """, status_filter)
-
-        if not rows:
-            await message.answer(
-                f"No {status_filter} withdrawals found."
-            )
-            return
-
-        out = f"💳 WITHDRAWALS: {status_filter.upper()}\n\n"
-
-        for r in rows:
-            saved_wallet = r["wallet"]
-
-            if "|" in saved_wallet:
-                network, wallet = saved_wallet.split("|", 1)
-            else:
-                network, wallet = "OLD REQUEST", saved_wallet
-
-            out += (
-                f"ID: {r['withdrawal_id']}\n"
-                f"User: {r['user_id']}\n"
-                f"Amount: {r['amount']} points "
-                f"(${r['amount'] / 1000:.2f} USDT)\n"
-                f"Network: {network}\n"
-                f"Wallet: {wallet}\n"
-                f"Status: {r['status'].upper()}\n"
-                f"TXID: {r['txid'] or 'Not available'}\n\n"
-            )
-
-        await message.answer(out)
-
-    except Exception as e:
-        await message.answer(f"Error: {str(e)}")
-
-
-
+    if not await is_admin(message.from_user.id): return
+    parts=message.text.split(maxsplit=1); status=parts[1].lower() if len(parts)>1 else "all"
+    if status not in {"all","pending","approved","paid","rejected"}:
+        await message.answer("Use: /withdrawals [pending|approved|paid|rejected]"); return
+    async with db_pool.acquire() as c:
+        if status=="all":
+            rows=await c.fetch("SELECT * FROM withdrawals ORDER BY withdrawal_id DESC LIMIT 30")
+        else: rows=await c.fetch("SELECT * FROM withdrawals WHERE status=$1 ORDER BY withdrawal_id DESC LIMIT 30",status)
+    out=[]
+    for r in rows:
+        net,_,*rest=r["wallet"].partition("|")
+        wallet=rest[0] if rest else net
+        network=net if rest else "legacy"
+        out.append(f"#{r['withdrawal_id']} user {r['user_id']} | {r['amount']} pts (${r['amount']/1000:.2f})\n{network} {wallet}\n{r['status']} | TXID: {r['txid'] or '-'}")
+    await message.answer("\n\n".join(out) or "No withdrawals.")
 
 
 @dp.message(Command("approvewithdraw"))
 async def approve_withdrawal(message: Message):
-    if not await is_admin(message.from_user.id):
-        return
-
+    if not await is_admin(message.from_user.id): return
     try:
-        wid = int(message.text.split()[1])
-
-        async with db_pool.acquire() as conn:
-            row = await conn.fetchrow("""
-                UPDATE withdrawals
-                SET status = 'approved'
-                WHERE withdrawal_id = $1 AND status = 'pending'
-                RETURNING user_id, amount, wallet
-            """, wid)
-
-        if not row:
-            await message.answer("Pending request not found.")
-            return
-
-        saved_wallet = row["wallet"]
-
-        if "|" in saved_wallet:
-            network, wallet = saved_wallet.split("|", 1)
-        else:
-            network, wallet = "OLD REQUEST", saved_wallet
-
-        usdt = row["amount"] / 1000
-
-        await message.answer(
-            f"✅ Withdrawal #{wid} approved.\n\n"
-            f"Amount: ${usdt:.2f} USDT\n"
-            f"Network: {network}\n"
-            f"Wallet: {wallet}\n\n"
-            f"After sending crypto, submit:\n"
-            f"/markpaid {wid} TXID"
-        )
-
-        try:
-            await bot.send_message(
-                row["user_id"],
-                f"⏳ Your withdrawal #{wid} has been approved. "
-                f"Payment is being processed."
-            )
-        except Exception:
-            pass
-
-    except (ValueError, IndexError):
-        await message.answer("Use: /approvewithdraw ID")
-
+        wid=int(message.text.split()[1])
+        async with db_pool.acquire() as c:
+            r=await c.fetchrow("UPDATE withdrawals SET status='approved' WHERE withdrawal_id=$1 AND status='pending' RETURNING user_id,amount",wid)
+        if not r: await message.answer("Pending request not found."); return
+        await message.answer(f"Approved. Send ${r['amount']/1000:.2f} manually, then /markpaid {wid} TXID")
+        try: await bot.send_message(r["user_id"],f"Withdrawal #{wid} approved; payment is being processed.")
+        except Exception: pass
+    except (ValueError,IndexError): await message.answer("Use: /approvewithdraw ID")
 
 
 @dp.message(Command("markpaid"))
-async def mark_withdrawal_paid(message: Message):
-    if not await is_admin(message.from_user.id):
-        return
-
+async def mark_paid(message: Message):
+    if not await is_admin(message.from_user.id): return
     try:
-        _, wid_text, txid = message.text.split(maxsplit=2)
-        wid = int(wid_text)
-        txid = txid.strip()
-
-        if not txid:
-            await message.answer("TXID is required.")
-            return
-
-        async with db_pool.acquire() as conn:
-            await conn.execute("""
-                ALTER TABLE withdrawals
-                ADD COLUMN IF NOT EXISTS txid TEXT
-            """)
-
-            row = await conn.fetchrow("""
-                UPDATE withdrawals
-                SET status = 'paid', txid = $2
-                WHERE withdrawal_id = $1 AND status = 'approved'
-                RETURNING user_id, amount
-            """, wid, txid)
-
-        if not row:
-            await message.answer(
-                "Approved withdrawal not found or already paid."
-            )
-            return
-
-        await message.answer(
-            f"✅ Withdrawal #{wid} marked as PAID.\n"
-            f"TXID: {txid}"
-        )
-
-        try:
-            await bot.send_message(
-                row["user_id"],
-                f"✅ Your withdrawal #{wid} has been PAID!\n"
-                f"Amount: ${row['amount'] / 1000:.2f} USDT\n"
-                f"TXID: {txid}"
-            )
-        except Exception:
-            pass
-
-    except (ValueError, IndexError):
-        await message.answer("Use: /markpaid ID TXID")
+        _,wid,txid=message.text.split(maxsplit=2); wid=int(wid)
+        if not valid_txid(txid): raise ValueError
+        txid=txid.lower().removeprefix("0x")
+        async with db_pool.acquire() as c:
+            r=await c.fetchrow("UPDATE withdrawals SET status='paid',txid=$2 WHERE withdrawal_id=$1 AND status='approved' RETURNING user_id,amount",wid,txid)
+        if not r: await message.answer("Approved withdrawal not found, already paid, or TXID already used."); return
+        await message.answer(f"Withdrawal #{wid} marked paid. TXID: {txid}")
+        try: await bot.send_message(r["user_id"],f"Withdrawal paid: ${r['amount']/1000:.2f} USDT\nTXID: {txid}")
+        except Exception: pass
+    except (ValueError,IndexError): await message.answer("Use: /markpaid ID 64_CHARACTER_TXID")
 
 
 @dp.message(Command("mywithdrawals"))
 async def my_withdrawals(message: Message):
-    uid = message.from_user.id
-
-    async with db_pool.acquire() as conn:
-        await conn.execute("""
-            ALTER TABLE withdrawals
-            ADD COLUMN IF NOT EXISTS txid TEXT
-        """)
-
-        rows = await conn.fetch("""
-            SELECT withdrawal_id, amount, wallet, status, txid
-            FROM withdrawals
-            WHERE user_id = $1
-            ORDER BY withdrawal_id DESC
-            LIMIT 10
-        """, uid)
-
-    if not rows:
-        await message.answer("You have no withdrawal history.")
-        return
-
-    out = "📋 YOUR WITHDRAWAL HISTORY\n\n"
-
-    for r in rows:
-        saved_wallet = r["wallet"]
-
-        if "|" in saved_wallet:
-            network, wallet = saved_wallet.split("|", 1)
-        else:
-            network, wallet = "OLD REQUEST", saved_wallet
-
-        out += (
-            f"ID: {r['withdrawal_id']}\n"
-            f"Amount: ${r['amount'] / 1000:.2f} USDT\n"
-            f"Network: {network}\n"
-            f"Status: {r['status'].upper()}\n"
-            f"TXID: {r['txid'] or 'Not available'}\n\n"
-        )
-
-    await message.answer(out)
-
+    if not await allowed(message): return
+    async with db_pool.acquire() as c:
+        rows=await c.fetch("SELECT withdrawal_id,amount,wallet,status,txid FROM withdrawals WHERE user_id=$1 ORDER BY withdrawal_id DESC LIMIT 10",message.from_user.id)
+    await message.answer("\n\n".join(f"#{r['withdrawal_id']} ${r['amount']/1000:.2f} | {r['status']}\nTXID: {r['txid'] or '-'}" for r in rows) or "No withdrawal history.")
 
 
 @dp.message(Command("rejectwithdraw"))
 async def reject_withdrawal(message: Message):
-    if not await is_admin(message.from_user.id):
-        return
+    if not await is_admin(message.from_user.id): return
     try:
-        wid = int(message.text.split()[1])
-        async with db_pool.acquire() as conn:
-            async with conn.transaction():
-                row = await conn.fetchrow("""
-                    UPDATE withdrawals SET status = 'rejected'
-                    WHERE withdrawal_id = $1 AND status = 'pending'
-                    RETURNING user_id, amount
-                """, wid)
-                if row:
-                    await conn.execute("UPDATE users SET points = points + $1 WHERE user_id = $2", row["amount"], row["user_id"])
-        if not row:
-            await message.answer("Pending request not found.")
-            return
-        await message.answer("❌ Withdrawal rejected. Points refunded.")
-        try:
-            await bot.send_message(row["user_id"], "Your withdrawal was rejected. Points have been refunded.")
-        except Exception:
-            pass
-    except (ValueError, IndexError):
-        await message.answer("Use: /rejectwithdraw ID")
+        wid=int(message.text.split()[1])
+        async with db_pool.acquire() as c:
+            async with c.transaction():
+                r=await c.fetchrow("UPDATE withdrawals SET status='rejected' WHERE withdrawal_id=$1 AND status='pending' RETURNING user_id,amount",wid)
+                if r: await c.execute("UPDATE users SET points=points+$1 WHERE user_id=$2",r["amount"],r["user_id"])
+        await message.answer("Rejected and points refunded." if r else "Pending request not found.")
+    except (ValueError,IndexError): await message.answer("Use: /rejectwithdraw ID")
 
 
-# ---------------- REFERRAL / SETTINGS ----------------
-
+# REFERRALS / SETTINGS / BROADCAST
 @dp.message(Command("referral"))
 async def referral(message: Message):
-    if not await allowed(message):
-        return
-    me = await bot.get_me()
-    uid = message.from_user.id
-    async with db_pool.acquire() as conn:
-        count = await conn.fetchval("SELECT COUNT(*) FROM users WHERE referred_by = $1", uid)
-    bonus = await get_setting("referral_bonus", REFERRAL_BONUS)
-    await message.answer(f"👥 Your referrals: {count}\n🎁 Referral bonus: {bonus} points\n\nYour referral link:\nhttps://t.me/{me.username}?start=ref_{uid}")
-
-
-@dp.message(Command("setadreward"))
-async def set_ad_reward(message: Message):
-    if not await is_admin(message.from_user.id):
-        return
-    try:
-        amount = int(message.text.split()[1])
-        if amount < 0:
-            raise ValueError
-        await set_setting("ad_reward", amount)
-        await message.answer(f"✅ Test ad reward set to {amount} points.")
-    except (ValueError, IndexError):
-        await message.answer("Use: /setadreward AMOUNT")
+    if not await allowed(message): return
+    me=await bot.get_me()
+    async with db_pool.acquire() as c: count=await c.fetchval("SELECT COUNT(*) FROM users WHERE referred_by=$1",message.from_user.id)
+    bonus=await get_setting("referral_bonus",REFERRAL_BONUS)
+    await message.answer(f"Referrals: {count}\nBonus: {bonus} points\nhttps://t.me/{me.username}?start=ref_{message.from_user.id}")
 
 
 @dp.message(Command("setminwithdraw"))
 async def set_min_withdraw(message: Message):
-    if not await is_admin(message.from_user.id):
-        return
+    if not await is_admin(message.from_user.id): return
     try:
-        amount = int(message.text.split()[1])
-        if amount <= 0:
-            raise ValueError
-        await set_setting("min_withdraw", amount)
-        await message.answer(f"✅ Minimum withdrawal set to {amount} points.")
-    except (ValueError, IndexError):
-        await message.answer("Use: /setminwithdraw AMOUNT")
+        amount=int(message.text.split()[1])
+        if amount<5000: raise ValueError
+        await set_setting("min_withdraw",amount)
+        await message.answer(f"Minimum withdrawal set to {amount} points.")
+    except (ValueError,IndexError): await message.answer("Use: /setminwithdraw AMOUNT (minimum 5000)")
 
 
 @dp.message(Command("setrefbonus"))
 async def set_ref_bonus(message: Message):
-    if not await is_admin(message.from_user.id):
-        return
+    if not await is_admin(message.from_user.id): return
     try:
-        amount = int(message.text.split()[1])
-        if amount < 0:
-            raise ValueError
-        await set_setting("referral_bonus", amount)
-        await message.answer(f"✅ Referral bonus set to {amount} points.")
-    except (ValueError, IndexError):
-        await message.answer("Use: /setrefbonus AMOUNT")
+        n=int(message.text.split()[1])
+        if n<0: raise ValueError
+        await set_setting("referral_bonus",n); await message.answer("Referral bonus updated.")
+    except (ValueError,IndexError): await message.answer("Use: /setrefbonus AMOUNT")
 
 
 @dp.message(Command("broadcast"))
 async def broadcast(message: Message):
-    if not await is_admin(message.from_user.id):
-        return
-    text = message.text.partition(" ")[2].strip()
-    if not text:
-        await message.answer("Use: /broadcast YOUR MESSAGE")
-        return
-    async with db_pool.acquire() as conn:
-        users = await conn.fetch("SELECT user_id FROM users WHERE is_banned = FALSE")
-    sent = failed = 0
+    if not await is_admin(message.from_user.id): return
+    body=message.text.partition(" ")[2].strip()
+    if not body: await message.answer("Use: /broadcast MESSAGE"); return
+    async with db_pool.acquire() as c: users=await c.fetch("SELECT user_id FROM users WHERE is_banned=FALSE")
+    sent=failed=0
     for u in users:
-        try:
-            await bot.send_message(u["user_id"], text)
-            sent += 1
-        except Exception:
-            failed += 1
-    await message.answer(f"📢 Broadcast finished!\nSent: {sent}\nFailed: {failed}")
+        try: await bot.send_message(u["user_id"],body); sent+=1
+        except Exception: failed+=1
+        await asyncio.sleep(0.04)
+    await message.answer(f"Broadcast done. Sent: {sent}; failed: {failed}")
 
 
-# ---------------- ADVERTISER WALLET ----------------
-
-@dp.message(lambda m: m.text in ("👛 Wallet", "/wallet"))
-async def advertiser_wallet(message: Message):
-    if not await allowed(message):
-        return
-    w = await ensure_wallet(message.from_user.id)
-    await message.answer(
-        "👛 ADVERTISER WALLET\n\n"
-        f"Available: {Decimal(w['available']):.8f} USDT\n"
-        f"Reserved for campaigns: {Decimal(w['reserved']):.8f} USDT\n\n"
-        "Use /deposit to add USDT.\n"
-        "Use /advwithdraw AMOUNT NETWORK WALLET to withdraw available funds.\n"
-        "Use /transactions to view history."
-    )
+# ADVERTISER WALLET / DEPOSITS
+@dp.message(lambda m:m.text in ("👛 Wallet","/wallet"))
+async def wallet_menu(message: Message):
+    if not await allowed(message): return
+    w=await ensure_wallet(message.from_user.id)
+    await message.answer(f"👛 ADVERTISER WALLET\nAvailable: {w['available']} USDT\nReserved: {w['reserved']} USDT\n/deposit\n/advwithdraw AMOUNT NETWORK WALLET\n/transactions")
 
 
 @dp.message(Command("deposit"))
-async def advertiser_deposit(message: Message):
-    if not await allowed(message):
-        return
+async def deposit(message: Message):
+    if not await allowed(message): return
     await ensure_wallet(message.from_user.id)
-    trc20 = await get_setting("deposit_address_TRC20", USDT_TRC20_ADDRESS)
-    bep20 = await get_setting("deposit_address_BEP20", USDT_BEP20_ADDRESS)
-    await message.answer(
-        "💵 USDT DEPOSIT\n\n"
-        f"TRC20 address: {trc20 or 'Not configured yet'}\n"
-        f"BEP20 address: {bep20 or 'Not configured yet'}\n\n"
-        "Send USDT using the exact matching network. Network fee is paid by you.\n"
-        "After sending, submit:\n"
-        "/depositproof AMOUNT NETWORK TXID\n\n"
-        "Example: /depositproof 25 TRC20 transaction_hash\n"
-        "Your balance is credited only after admin verifies the transaction on the blockchain."
-    )
+    a=await get_setting("deposit_address_TRC20",USDT_TRC20_ADDRESS)
+    b=await get_setting("deposit_address_BEP20",USDT_BEP20_ADDRESS)
+    await message.answer(f"USDT DEPOSIT\nTRC20: {a or 'Not configured'}\nBEP20: {b or 'Not configured'}\nSend on the matching network, then:\n/depositproof AMOUNT NETWORK TXID\nCredit occurs only after blockchain verification.")
 
 
 @dp.message(Command("depositproof"))
 async def deposit_proof(message: Message):
-    if not await allowed(message):
-        return
+    if not await allowed(message): return
     try:
-        _, amount_text, network, txid = message.text.split(maxsplit=3)
-        amount = parse_usdt(amount_text)
-        network = network.upper()
-        if network not in {"TRC20", "BEP20"} or len(txid) < 10:
-            raise ValueError
-        async with db_pool.acquire() as conn:
-            exists = await conn.fetchval("SELECT tx_id FROM advertiser_transactions WHERE reference = $1", txid)
-            if exists:
-                await message.answer("This transaction ID has already been submitted.")
-                return
-            tx = await conn.fetchval("""
-                INSERT INTO advertiser_transactions (user_id, tx_type, amount, network, reference, note)
-                VALUES ($1, 'deposit', $2, $3, $4, 'Advertiser deposit proof')
-                RETURNING tx_id
-            """, message.from_user.id, amount, network, txid)
-        await message.answer(f"✅ Deposit proof submitted. Request ID: {tx}\nYour wallet will be credited after admin verification.")
-        for admin_id in ADMIN_IDS:
-            try:
-                await bot.send_message(admin_id, f"💵 Deposit proof #{tx}\nUser: {message.from_user.id}\nAmount: {amount} USDT\nNetwork: {network}\nTXID: {txid}\nReview with /deposits")
-            except Exception:
-                pass
-    except (ValueError, IndexError):
-        await message.answer("Use: /depositproof AMOUNT TRC20|BEP20 TXID")
+        _,amt,network,txid=message.text.split(maxsplit=3)
+        amount=parse_usdt(amt); network=network.upper()
+        if network not in {"TRC20","BEP20"} or not valid_txid(txid): raise ValueError
+        txid=txid.lower().removeprefix("0x")
+        async with db_pool.acquire() as c:
+            tx=await c.fetchval("""INSERT INTO advertiser_transactions(user_id,tx_type,amount,network,reference,note)
+              VALUES($1,'deposit',$2,$3,$4,'Deposit proof') ON CONFLICT DO NOTHING RETURNING tx_id""",
+              message.from_user.id,amount,network,txid)
+        if not tx: await message.answer("This TXID has already been submitted."); return
+        await message.answer(f"Deposit proof #{tx} submitted. Admin will verify it on-chain.")
+        for aid in ADMIN_IDS:
+            try: await bot.send_message(aid,f"Deposit #{tx}: user {message.from_user.id}, {amount} USDT {network}, TXID {txid}. /deposits")
+            except Exception: pass
+    except (ValueError,IndexError): await message.answer("Use: /depositproof AMOUNT TRC20|BEP20 TXID")
 
 
 @dp.message(Command("transactions"))
-async def advertiser_transactions(message: Message):
-    if not await allowed(message):
-        return
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch("""
-            SELECT tx_id, tx_type, amount, network, status, reference, created_at
-            FROM advertiser_transactions WHERE user_id = $1
-            ORDER BY tx_id DESC LIMIT 15
-        """, message.from_user.id)
-    if not rows:
-        await message.answer("No advertiser transactions yet.")
-        return
-    out = "📜 ADVERTISER TRANSACTIONS\n\n"
-    for r in rows:
-        out += f"#{r['tx_id']} {r['tx_type']} {r['amount']} USDT | {r['network'] or '-'} | {r['status']}\n"
-    await message.answer(out)
+async def transactions(message: Message):
+    if not await allowed(message): return
+    async with db_pool.acquire() as c:
+        rows=await c.fetch("SELECT tx_id,tx_type,amount,network,status FROM advertiser_transactions WHERE user_id=$1 ORDER BY tx_id DESC LIMIT 15",message.from_user.id)
+    await message.answer("\n".join(f"#{r['tx_id']} {r['tx_type']} {r['amount']} {r['network'] or ''} {r['status']}" for r in rows) or "No transactions.")
 
 
 @dp.message(Command("deposits"))
-async def admin_deposits(message: Message):
-    if not await is_admin(message.from_user.id):
-        return
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch("""
-            SELECT tx_id, user_id, amount, network, reference
-            FROM advertiser_transactions
-            WHERE tx_type = 'deposit' AND status = 'pending'
-            ORDER BY tx_id DESC LIMIT 20
-        """)
-    if not rows:
-        await message.answer("No pending deposits.")
-        return
-    out = "💵 PENDING ADVERTISER DEPOSITS\n\n"
-    for r in rows:
-        out += f"ID: {r['tx_id']} | User: {r['user_id']}\nAmount: {r['amount']} USDT | {r['network']}\nTXID: {r['reference']}\n\n"
-    await message.answer(out)
-
+async def deposits(message: Message):
+    if not await is_admin(message.from_user.id): return
+    async with db_pool.acquire() as c:
+        rows=await c.fetch("SELECT tx_id,user_id,amount,network,reference FROM advertiser_transactions WHERE tx_type='deposit' AND status='pending' ORDER BY tx_id DESC LIMIT 20")
+    await message.answer("\n\n".join(f"#{r['tx_id']} user {r['user_id']} {r['amount']} {r['network']}\n{r['reference']}" for r in rows) or "No pending deposits.")
 
 
 @dp.message(Command("approvedeposit"))
 async def approve_deposit(message: Message):
-    if not await is_admin(message.from_user.id):
-        return
-
+    if not await is_admin(message.from_user.id): return
     try:
-        txid = int(message.text.split()[1])
-
-        async with db_pool.acquire() as conn:
-            row = await conn.fetchrow("""
-                SELECT * FROM advertiser_transactions
-                WHERE tx_id = $1
-                AND tx_type = 'deposit'
-                AND status = 'pending'
-            """, txid)
-
-        if not row:
-            await message.answer("Pending deposit not found.")
-            return
-
-        # Verify actual blockchain transaction
-        try:
-            verified = await verify_deposit_on_blockchain(
-                row["network"],
-                row["reference"],
-                row["amount"]
-            )
-        except Exception as e:
-            await message.answer(
-                f"Blockchain verification error: {str(e)[:250]}\n"
-                "No balance was credited."
-            )
-            return
-
-        if not verified:
-            await message.answer(
-                "❌ Blockchain verification failed.\n"
-                "No balance was credited."
-            )
-            return
-
-        async with db_pool.acquire() as conn:
-            async with conn.transaction():
-
-                await conn.execute(
-                    "SELECT pg_advisory_xact_lock(hashtext($1))",
-                    row["reference"].lower()
-                )
-
-                current = await conn.fetchrow("""
-                    SELECT * FROM advertiser_transactions
-                    WHERE tx_id = $1
-                    AND tx_type = 'deposit'
-                    AND status = 'pending'
-                    FOR UPDATE
-                """, txid)
-
-                if not current:
-                    await message.answer(
-                        "Deposit already processed."
-                    )
-                    return
-
-                duplicate = await conn.fetchval("""
-                    SELECT EXISTS(
-                        SELECT 1 FROM advertiser_transactions
-                        WHERE tx_type = 'deposit'
-                        AND LOWER(reference) = LOWER($1)
-                        AND status = 'approved'
-                        AND tx_id != $2
-                    )
-                """, row["reference"], txid)
-
-                if duplicate:
-                    await message.answer(
-                        "This transaction was already credited."
-                    )
-                    return
-
-                await conn.execute("""
-                    UPDATE advertiser_transactions
-                    SET status = 'approved'
-                    WHERE tx_id = $1
-                """, txid)
-
-                await conn.execute("""
-                    INSERT INTO advertiser_wallets (user_id, available)
-                    VALUES ($1, $2)
-                    ON CONFLICT (user_id) DO UPDATE
-                    SET available = advertiser_wallets.available
-                        + EXCLUDED.available,
-                        updated_at = NOW()
-                """, row["user_id"], row["amount"])
-
-        await message.answer(
-            f"✅ Deposit #{txid} verified and approved.\n"
-            f"Wallet credited: {row['amount']} USDT."
-        )
-
-        try:
-            await bot.send_message(
-                row["user_id"],
-                f"✅ Your deposit #{txid} was verified.\n"
-                f"{row['amount']} USDT added to your Advertiser Wallet."
-            )
-        except Exception:
-            pass
-
-    except (ValueError, IndexError):
-        await message.answer("Use: /approvedeposit TX_ID")
-
+        tid=int(message.text.split()[1])
+        async with db_pool.acquire() as c:
+            row=await c.fetchrow("SELECT * FROM advertiser_transactions WHERE tx_id=$1 AND tx_type='deposit' AND status='pending'",tid)
+        if not row: await message.answer("Pending deposit not found."); return
+        if not await verify_deposit_on_blockchain(row["network"],row["reference"],row["amount"]):
+            await message.answer("Blockchain verification failed. No funds credited."); return
+        async with db_pool.acquire() as c:
+            async with c.transaction():
+                await c.execute("SELECT pg_advisory_xact_lock(hashtext($1))",row["reference"].lower())
+                current=await c.fetchrow("SELECT * FROM advertiser_transactions WHERE tx_id=$1 AND status='pending' FOR UPDATE",tid)
+                if not current: await message.answer("Already processed."); return
+                await c.execute("UPDATE advertiser_transactions SET status='approved' WHERE tx_id=$1",tid)
+                await c.execute("""INSERT INTO advertiser_wallets(user_id,available) VALUES($1,$2)
+                  ON CONFLICT(user_id) DO UPDATE SET available=advertiser_wallets.available+EXCLUDED.available,updated_at=NOW()""",
+                  row["user_id"],row["amount"])
+        await message.answer(f"Deposit #{tid} verified; {row['amount']} USDT credited.")
+        try: await bot.send_message(row["user_id"],f"Deposit verified: {row['amount']} USDT credited.")
+        except Exception: pass
+    except (ValueError,IndexError): await message.answer("Use: /approvedeposit TX_ID")
+    except Exception as e:
+        print("Deposit approval error:",repr(e)); await message.answer("Verification error; no credit made.")
 
 
 @dp.message(Command("rejectdeposit"))
 async def reject_deposit(message: Message):
-    if not await is_admin(message.from_user.id):
-        return
+    if not await is_admin(message.from_user.id): return
     try:
-        txid = int(message.text.split()[1])
-        async with db_pool.acquire() as conn:
-            row = await conn.fetchrow("""
-                UPDATE advertiser_transactions SET status = 'rejected'
-                WHERE tx_id = $1 AND tx_type = 'deposit' AND status = 'pending'
-                RETURNING user_id
-            """, txid)
-        if not row:
-            await message.answer("Pending deposit not found.")
-            return
-        await message.answer(f"❌ Deposit #{txid} rejected.")
-        try:
-            await bot.send_message(row["user_id"], f"Your deposit request #{txid} was rejected. Contact support if you believe this is an error.")
-        except Exception:
-            pass
-    except (ValueError, IndexError):
-        await message.answer("Use: /rejectdeposit TX_ID")
+        tid=int(message.text.split()[1])
+        async with db_pool.acquire() as c:
+            r=await c.fetchrow("UPDATE advertiser_transactions SET status='rejected' WHERE tx_id=$1 AND tx_type='deposit' AND status='pending' RETURNING user_id",tid)
+        await message.answer("Deposit rejected." if r else "Pending deposit not found.")
+    except (ValueError,IndexError): await message.answer("Use: /rejectdeposit ID")
 
 
 @dp.message(Command("setdepositaddress"))
 async def set_deposit_address(message: Message):
-    if not await is_admin(message.from_user.id):
-        return
+    if not await is_admin(message.from_user.id): return
     try:
-        _, network, address = message.text.split(maxsplit=2)
-        network = network.upper()
-        if network not in {"TRC20", "BEP20"} or len(address) < 20:
-            raise ValueError
-        key = "deposit_address_" + network
-        await set_setting(key, address)
-        await message.answer(f"✅ {network} deposit address saved in database.")
-    except (ValueError, IndexError):
-        await message.answer("Use: /setdepositaddress TRC20|BEP20 ADDRESS")
+        _,network,address=message.text.split(maxsplit=2); network=network.upper()
+        if not valid_wallet(network,address): raise ValueError
+        await set_setting("deposit_address_"+network,address)
+        await message.answer(f"{network} deposit address saved.")
+    except (ValueError,IndexError): await message.answer("Use: /setdepositaddress TRC20|BEP20 ADDRESS")
 
 
-# ---------------- ADVERTISER WITHDRAWALS ----------------
-
+# ADVERTISER WITHDRAWALS
 @dp.message(Command("advwithdraw"))
-async def advertiser_withdraw(message: Message):
-    if not await allowed(message):
-        return
+async def adv_withdraw(message: Message):
+    if not await allowed(message): return
     try:
-        _, amount_text, network, wallet = message.text.split(maxsplit=3)
-        amount = parse_usdt(amount_text)
-        network = network.upper()
-        if network not in {"TRC20", "BEP20"} or len(wallet) < 20:
-            raise ValueError
-        minimum = Decimal(str(await get_setting("adv_min_withdraw", "10")))
-        if amount < minimum:
-            await message.answer(f"Minimum advertiser withdrawal is {minimum} USDT.")
-            return
-        uid = message.from_user.id
-        async with db_pool.acquire() as conn:
-            async with conn.transaction():
-                w = await conn.fetchrow("SELECT available FROM advertiser_wallets WHERE user_id = $1 FOR UPDATE", uid)
-                if not w or Decimal(w["available"]) < amount:
-                    await message.answer("Insufficient available balance. Reserved campaign funds cannot be withdrawn.")
-                    return
-                await conn.execute("UPDATE advertiser_wallets SET available = available - $1, updated_at = NOW() WHERE user_id = $2", amount, uid)
-                wid = await conn.fetchval("""
-                    INSERT INTO advertiser_withdrawals (user_id, amount, network, wallet)
-                    VALUES ($1, $2, $3, $4) RETURNING withdrawal_id
-                """, uid, amount, network, wallet)
-                await conn.execute("""
-                    INSERT INTO advertiser_transactions (user_id, tx_type, amount, network, reference, status, note)
-                    VALUES ($1, 'withdrawal', $2, $3, $4, 'pending', $5)
-                """, uid, amount, network, wallet, f"Withdrawal request #{wid}")
-        await message.answer(f"✅ Withdrawal request #{wid} submitted.\nAmount: {amount} USDT\nNetwork fee is deducted from the payout, not your requested wallet balance. Admin will process it manually.")
-    except (ValueError, IndexError):
-        await message.answer("Use: /advwithdraw AMOUNT TRC20|BEP20 WALLET_ADDRESS")
+        _,amt,network,wallet=message.text.split(maxsplit=3)
+        amount=parse_usdt(amt); network=network.upper()
+        if network not in {"TRC20","BEP20"} or not valid_wallet(network,wallet): raise ValueError
+        minimum=Decimal(str(await get_setting("adv_min_withdraw","10")))
+        if amount<minimum: await message.answer(f"Minimum advertiser withdrawal: {minimum} USDT."); return
+        uid=message.from_user.id
+        async with db_pool.acquire() as c:
+            async with c.transaction():
+                w=await c.fetchrow("SELECT available FROM advertiser_wallets WHERE user_id=$1 FOR UPDATE",uid)
+                if not w or w["available"]<amount: await message.answer("Insufficient available balance."); return
+                await c.execute("UPDATE advertiser_wallets SET available=available-$1,updated_at=NOW() WHERE user_id=$2",amount,uid)
+                wid=await c.fetchval("INSERT INTO advertiser_withdrawals(user_id,amount,network,wallet) VALUES($1,$2,$3,$4) RETURNING withdrawal_id",uid,amount,network,wallet)
+                await c.execute("INSERT INTO advertiser_transactions(user_id,tx_type,amount,network,reference,status,note) VALUES($1,'withdrawal',$2,$3,$4,'pending',$5)",uid,amount,network,wallet,f"Withdrawal request #{wid}")
+        await message.answer(f"Advertiser withdrawal #{wid} submitted. Admin pays manually after review.")
+    except (ValueError,IndexError): await message.answer("Use: /advwithdraw AMOUNT TRC20|BEP20 WALLET")
 
 
 @dp.message(Command("advertiserwithdrawals"))
-async def admin_adv_withdrawals(message: Message):
-    if not await is_admin(message.from_user.id):
-        return
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch("SELECT withdrawal_id, user_id, amount, network, wallet FROM advertiser_withdrawals WHERE status = 'pending' ORDER BY withdrawal_id DESC LIMIT 20")
-    if not rows:
-        await message.answer("No pending advertiser withdrawals.")
-        return
-    out = "👛 ADVERTISER WITHDRAWALS\n\n"
-    for r in rows:
-        out += f"ID: {r['withdrawal_id']} | User: {r['user_id']}\n{r['amount']} USDT {r['network']}\nWallet: {r['wallet']}\n\n"
-    await message.answer(out)
+async def adv_withdrawals(message: Message):
+    if not await is_admin(message.from_user.id): return
+    async with db_pool.acquire() as c:
+        rows=await c.fetch("SELECT * FROM advertiser_withdrawals WHERE status IN ('pending','approved') ORDER BY withdrawal_id DESC LIMIT 30")
+    await message.answer("\n\n".join(f"#{r['withdrawal_id']} user {r['user_id']} {r['amount']} {r['network']}\n{r['wallet']} | {r['status']} | TXID {r['txid'] or '-'}" for r in rows) or "No advertiser withdrawals.")
 
 
 @dp.message(Command("approveadvwithdraw"))
-async def approve_adv_withdraw(message: Message):
-    if not await is_admin(message.from_user.id):
-        return
+async def approve_advwithdraw(message: Message):
+    if not await is_admin(message.from_user.id): return
     try:
-        wid = int(message.text.split()[1])
-        async with db_pool.acquire() as conn:
-            async with conn.transaction():
-                row = await conn.fetchrow("""
-                    UPDATE advertiser_withdrawals SET status = 'approved'
-                    WHERE withdrawal_id = $1 AND status = 'pending'
-                    RETURNING user_id, amount, network
-                """, wid)
-                if not row:
-                    await message.answer("Pending withdrawal not found.")
-                    return
-                await conn.execute("""
-                    UPDATE advertiser_transactions SET status = 'approved'
-                    WHERE user_id = $1 AND tx_type = 'withdrawal' AND note = $2 AND status = 'pending'
-                """, row["user_id"], f"Withdrawal request #{wid}")
-        await message.answer(f"✅ Advertiser withdrawal #{wid} marked approved. Send the crypto manually.")
-        try:
-            await bot.send_message(row["user_id"], f"Your advertiser withdrawal #{wid} has been approved. Please check your wallet after the manual transfer.")
-        except Exception:
-            pass
-    except (ValueError, IndexError):
-        await message.answer("Use: /approveadvwithdraw ID")
+        wid=int(message.text.split()[1])
+        async with db_pool.acquire() as c:
+            async with c.transaction():
+                r=await c.fetchrow("UPDATE advertiser_withdrawals SET status='approved' WHERE withdrawal_id=$1 AND status='pending' RETURNING user_id",wid)
+                if r: await c.execute("UPDATE advertiser_transactions SET status='approved' WHERE note=$1 AND status='pending'",f"Withdrawal request #{wid}")
+        await message.answer(f"Approved. Send payment manually, then /markadvpaid {wid} TXID." if r else "Pending request not found.")
+    except (ValueError,IndexError): await message.answer("Use: /approveadvwithdraw ID")
+
+
+@dp.message(Command("markadvpaid"))
+async def mark_advpaid(message: Message):
+    if not await is_admin(message.from_user.id): return
+    try:
+        _,wid,txid=message.text.split(maxsplit=2); wid=int(wid)
+        if not valid_txid(txid): raise ValueError
+        txid=txid.lower().removeprefix("0x")
+        async with db_pool.acquire() as c:
+            r=await c.fetchrow("UPDATE advertiser_withdrawals SET status='paid',txid=$2 WHERE withdrawal_id=$1 AND status='approved' RETURNING user_id,amount",wid,txid)
+        if not r: await message.answer("Approved withdrawal not found, already paid, or TXID used."); return
+        async with db_pool.acquire() as c:
+            await c.execute("UPDATE advertiser_transactions SET status='paid' WHERE note=$1",f"Withdrawal request #{wid}")
+        await message.answer(f"Advertiser withdrawal #{wid} marked paid.")
+        try: await bot.send_message(r["user_id"],f"Advertiser withdrawal paid: {r['amount']} USDT. TXID: {txid}")
+        except Exception: pass
+    except (ValueError,IndexError): await message.answer("Use: /markadvpaid ID TXID")
 
 
 @dp.message(Command("rejectadvwithdraw"))
-async def reject_adv_withdraw(message: Message):
-    if not await is_admin(message.from_user.id):
-        return
+async def reject_advwithdraw(message: Message):
+    if not await is_admin(message.from_user.id): return
     try:
-        wid = int(message.text.split()[1])
-        async with db_pool.acquire() as conn:
-            async with conn.transaction():
-                row = await conn.fetchrow("""
-                    UPDATE advertiser_withdrawals SET status = 'rejected'
-                    WHERE withdrawal_id = $1 AND status = 'pending'
-                    RETURNING user_id, amount, network
-                """, wid)
-                if not row:
-                    await message.answer("Pending withdrawal not found.")
-                    return
-                await conn.execute("UPDATE advertiser_wallets SET available = available + $1, updated_at = NOW() WHERE user_id = $2", row["amount"], row["user_id"])
-                await conn.execute("""
-                    UPDATE advertiser_transactions SET status = 'rejected'
-                    WHERE user_id = $1 AND tx_type = 'withdrawal' AND note = $2 AND status = 'pending'
-                """, row["user_id"], f"Withdrawal request #{wid}")
-        await message.answer(f"❌ Advertiser withdrawal #{wid} rejected. Funds refunded to available wallet.")
-        try:
-            await bot.send_message(row["user_id"], f"Your advertiser withdrawal #{wid} was rejected. Funds have been returned to your wallet.")
-        except Exception:
-            pass
-    except (ValueError, IndexError):
-        await message.answer("Use: /rejectadvwithdraw ID")
+        wid=int(message.text.split()[1])
+        async with db_pool.acquire() as c:
+            async with c.transaction():
+                r=await c.fetchrow("UPDATE advertiser_withdrawals SET status='rejected' WHERE withdrawal_id=$1 AND status='pending' RETURNING user_id,amount",wid)
+                if r:
+                    await c.execute("UPDATE advertiser_wallets SET available=available+$1,updated_at=NOW() WHERE user_id=$2",r["amount"],r["user_id"])
+                    await c.execute("UPDATE advertiser_transactions SET status='rejected' WHERE note=$1",f"Withdrawal request #{wid}")
+        await message.answer("Rejected; funds returned." if r else "Pending withdrawal not found.")
+    except (ValueError,IndexError): await message.answer("Use: /rejectadvwithdraw ID")
 
 
 @dp.message(Command("setadvminwithdraw"))
-async def set_adv_min_withdraw(message: Message):
-    if not await is_admin(message.from_user.id):
-        return
+async def set_adv_min(message: Message):
+    if not await is_admin(message.from_user.id): return
     try:
-        amount = parse_usdt(message.text.split()[1])
-        await set_setting("adv_min_withdraw", str(amount))
-        await message.answer(f"✅ Advertiser minimum withdrawal set to {amount} USDT.")
-    except (ValueError, IndexError):
-        await message.answer("Use: /setadvminwithdraw AMOUNT")
+        amount=parse_usdt(message.text.split()[1]); await set_setting("adv_min_withdraw",str(amount))
+        await message.answer(f"Minimum advertiser withdrawal: {amount} USDT.")
+    except (ValueError,IndexError): await message.answer("Use: /setadvminwithdraw AMOUNT")
 
 
-# ---------------- ADVERTISER CAMPAIGNS ----------------
-
-@dp.message(lambda m: m.text in ("📢 Advertise", "/advertise"))
+# CAMPAIGNS
+@dp.message(lambda m:m.text in ("📢 Advertise","/advertise"))
 async def advertise_menu(message: Message):
-    if not await allowed(message):
-        return
-    await message.answer(
-        "📢 ADVERTISER CENTER\n\n"
-        "Create a promotion request with:\n"
-        "/createcampaign TITLE | CHANNEL_LINK | TARGET_MEMBERS | REWARD_PER_JOIN_USDT\n\n"
-        "Example:\n/createcampaign My Channel | https://t.me/example | 100 | 0.05\n\n"
-        "The total budget is calculated as target × reward per verified join.\n"
-        "Your wallet must have enough available USDT. Campaigns require admin approval before going live.\n\n"
-        "Use /mycampaigns to view your campaigns and /wallet for your balance."
-    )
+    if await allowed(message):
+        await message.answer("Create: /createcampaign TITLE | https://t.me/channel | TARGET | REWARD_PER_JOIN_USDT\n"
+                             "Campaign budget is reserved until spent or refunded.")
+
+
+async def get_public_chat(link):
+    if not link.startswith("https://t.me/") or link.startswith("https://t.me/+"):
+        raise ValueError("Use a public Telegram channel link")
+    username=link.rstrip("/").split("/")[-1].split("?")[0]
+    if not username or username.startswith("+"): raise ValueError("Invalid link")
+    chat=await bot.get_chat("@"+username)
+    if chat.type not in ("channel","supergroup"): raise ValueError("Not a channel/group")
+    me=await bot.get_me()
+    member=await bot.get_chat_member(chat.id,me.id)
+    if member.status not in ("administrator","creator"): raise ValueError("Bot must be admin")
+    return chat
 
 
 @dp.message(Command("createcampaign"))
 async def create_campaign(message: Message):
-    if not await allowed(message):
-        return
-
+    if not await allowed(message): return
     try:
-        raw = message.text.split(maxsplit=1)[1]
-        parts = [p.strip() for p in raw.split("|")]
-
-        if len(parts) != 4:
-            raise ValueError
-
-        title, link, target_text, reward_text = parts
-        target = int(target_text)
-        reward = parse_usdt(reward_text)
-
-        if (
-            not title
-            or not link.startswith("https://t.me/")
-            or link.startswith("https://t.me/+")
-            or target < 1
-            or target > 100000
-        ):
-            raise ValueError
-
-        username = link.rstrip("/").split("/")[-1]
-
-        if not username or username.startswith("+"):
-            raise ValueError
-
-        # Find the Telegram channel
-        chat = await bot.get_chat("@" + username)
-
-        if chat.type not in ("channel", "supergroup"):
-            await message.answer("Please provide a valid public channel or group link.")
-            return
-
-        # Check whether EarnWave bot is an administrator
-        me = await bot.get_me()
-        bot_member = await bot.get_chat_member(chat.id, me.id)
-
-        if bot_member.status not in ("administrator", "creator"):
-            await message.answer(
-                "Please make EarnWave Bot an admin in your channel/group first."
-            )
-            return
-
-        budget = (reward * target).quantize(Decimal("0.00000001"))
-
-        if budget < Decimal("1"):
-            await message.answer("Campaign budget must be at least 1 USDT.")
-            return
-
-        uid = message.from_user.id
-
-        async with db_pool.acquire() as conn:
-            async with conn.transaction():
-
-                wallet = await conn.fetchrow("""
-                    SELECT available
-                    FROM advertiser_wallets
-                    WHERE user_id = $1
-                    FOR UPDATE
-                """, uid)
-
-                if not wallet or Decimal(wallet["available"]) < budget:
-                    await message.answer(
-                        f"Insufficient available balance. Required: {budget} USDT. Use /deposit first."
-                    )
-                    return
-
-                await conn.execute("""
-                    UPDATE advertiser_wallets
-                    SET available = available - $1,
-                        reserved = reserved + $1,
-                        updated_at = NOW()
-                    WHERE user_id = $2
-                """, budget, uid)
-
-                cid = await conn.fetchval("""
-                    INSERT INTO campaigns (
-                        advertiser_id, title, channel_link,
-                        target_members, reward_per_join,
-                        total_budget, chat_id
-                    )
-                    VALUES ($1, $2, $3, $4, $5, $6, $7)
-                    RETURNING campaign_id
-                """, uid, title, link, target, reward, budget, str(chat.id))
-
-        await message.answer(
-            f"Campaign request #{cid} created.\n"
-            f"Channel: {title}\n"
-            f"Target: {target} joins\n"
-            f"Reward per join: {reward} USDT\n"
-            f"Reserved budget: {budget} USDT\n"
-            "Status: Pending admin review."
-        )
-
-        for admin_id in ADMIN_IDS:
-            try:
-                await bot.send_message(
-                    admin_id,
-                    f"New campaign #{cid}\n"
-                    f"Advertiser: {uid}\n"
-                    f"Title: {title}\n"
-                    f"Link: {link}\n"
-                    f"Channel ID: {chat.id}\n"
-                    f"Target: {target}\n"
-                    f"Reward: {reward} USDT\n"
-                    f"Budget: {budget} USDT\n"
-                    "Review with /campaigns"
-                )
-            except Exception:
-                pass
-
-    except (ValueError, IndexError):
-        await message.answer(
-            "Use:\n/createcampaign TITLE | https://t.me/channel | TARGET_MEMBERS | REWARD_PER_JOIN_USDT"
-        )
+        parts=[x.strip() for x in message.text.split(maxsplit=1)[1].split("|")]
+        if len(parts)!=4: raise ValueError
+        title,link,target_s,reward_s=parts
+        target=int(target_s); reward=parse_usdt(reward_s)
+        if not title or target<1 or target>100000: raise ValueError
+        chat=await get_public_chat(link)
+        budget=(reward*target).quantize(Decimal("0.00000001"))
+        if budget<1: await message.answer("Campaign budget must be at least 1 USDT."); return
+        uid=message.from_user.id
+        async with db_pool.acquire() as c:
+            async with c.transaction():
+                w=await c.fetchrow("SELECT available FROM advertiser_wallets WHERE user_id=$1 FOR UPDATE",uid)
+                if not w or w["available"]<budget: await message.answer(f"Insufficient funds. Required: {budget} USDT."); return
+                await c.execute("UPDATE advertiser_wallets SET available=available-$1,reserved=reserved+$1,updated_at=NOW() WHERE user_id=$2",budget,uid)
+                cid=await c.fetchval("""INSERT INTO campaigns(advertiser_id,title,channel_link,target_members,reward_per_join,total_budget,chat_id,status,is_test,budget_reserved)
+                  VALUES($1,$2,$3,$4,$5,$6,$7,'pending_payment',FALSE,TRUE) RETURNING campaign_id""",
+                  uid,title,link,target,reward,str(budget),str(chat.id))
+        await message.answer(f"Campaign #{cid} created; {budget} USDT reserved. Awaiting admin approval.")
+        for aid in ADMIN_IDS:
+            try: await bot.send_message(aid,f"Campaign #{cid}: {title}\nAdvertiser {uid}\n{link}\nBudget {budget}\n/campaigns")
+            except Exception: pass
+    except (ValueError,IndexError): await message.answer("Use: /createcampaign TITLE | https://t.me/channel | TARGET | REWARD")
     except Exception as e:
-        print(f"Campaign creation error: {e}")
-        await message.answer(
-            "Could not verify this channel. Make sure EarnWave Bot is an admin and the public channel link is correct."
-        )
-
+        print("Create campaign error:",repr(e)); await message.answer("Could not validate channel. Check public link and bot admin rights.")
 
 
 @dp.message(Command("testcampaign"))
-async def create_test_campaign(message: Message):
-    if not await is_admin(message.from_user.id):
-        return
-
+async def test_campaign(message: Message):
+    if not await is_admin(message.from_user.id): return
     try:
-        link = message.text.split(maxsplit=1)[1].strip()
-
-        if not link.startswith("https://t.me/") or link.startswith("https://t.me/+"):
-            await message.answer("Use: /testcampaign https://t.me/ChannelName")
-            return
-
-        username = link.rstrip("/").split("/")[-1]
-        chat = await bot.get_chat("@" + username)
-
-        if chat.type not in ("channel", "supergroup"):
-            await message.answer("Invalid public channel/group.")
-            return
-
-        me = await bot.get_me()
-        bot_member = await bot.get_chat_member(chat.id, me.id)
-
-        if bot_member.status not in ("administrator", "creator"):
-            await message.answer("Make EarnWave Bot an admin first.")
-            return
-
-        async with db_pool.acquire() as conn:
-            cid = await conn.fetchval("""
-                INSERT INTO campaigns (
-                    advertiser_id, title, channel_link,
-                    target_members, reward_per_join,
-                    total_budget, chat_id, status,
-                    verified_joins, spent
-                )
-                VALUES ($1, $2, $3, 5, 0.001, 0.005, $4, 'active', 0, 0)
-                RETURNING campaign_id
-            """, message.from_user.id, "TEST: " + chat.title,
-                 link, str(chat.id))
-
-        await message.answer(
-            f"✅ Test Campaign Created!\n"
-            f"Campaign ID: {cid}\n"
-            f"Channel: {chat.title}\n"
-            f"Target: 5 members\n"
-            f"Reward: 1 test point per verified join\n"
-            f"Use: /joincampaign {cid}"
-        )
-
-    except (ValueError, IndexError):
-        await message.answer(
-            "Use: /testcampaign https://t.me/ChannelName"
-        )
+        link=message.text.split(maxsplit=1)[1].strip()
+        chat=await get_public_chat(link)
+        async with db_pool.acquire() as c:
+            cid=await c.fetchval("""INSERT INTO campaigns(advertiser_id,title,channel_link,target_members,reward_per_join,total_budget,chat_id,status,is_test,budget_reserved)
+              VALUES($1,$2,$3,5,0,0,$4,'active',TRUE,FALSE) RETURNING campaign_id""",
+              message.from_user.id,"TEST: "+chat.title,link,str(chat.id))
+        await message.answer(f"Test campaign #{cid} created. Membership verification only; no redeemable points are awarded.\n/joincampaign {cid}")
+    except (ValueError,IndexError): await message.answer("Use: /testcampaign https://t.me/ChannelName")
     except Exception as e:
-        print(f"Test campaign error: {e}")
-        await message.answer("Could not create test campaign. Check channel settings.")
-
+        print("Test campaign error:",repr(e)); await message.answer("Could not create test campaign; check bot admin rights.")
 
 
 @dp.message(Command("mycampaigns"))
 async def my_campaigns(message: Message):
-    if not await allowed(message):
-        return
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch("""
-            SELECT campaign_id, title, target_members, verified_joins, total_budget, spent, status
-            FROM campaigns WHERE advertiser_id = $1 ORDER BY campaign_id DESC LIMIT 20
-        """, message.from_user.id)
-    if not rows:
-        await message.answer("You have no campaigns yet.")
-        return
-    out = "📢 YOUR CAMPAIGNS\n\n"
-    for r in rows:
-        progress = (r["verified_joins"] / r["target_members"] * 100) if r["target_members"] else 0
-        out += f"#{r['campaign_id']} {r['title']}\nStatus: {r['status']}\nProgress: {r['verified_joins']}/{r['target_members']} ({progress:.1f}%)\nSpent: {r['spent']} / {r['total_budget']} USDT\n\n"
-    await message.answer(out)
+    if not await allowed(message): return
+    async with db_pool.acquire() as c:
+        rows=await c.fetch("SELECT campaign_id,title,target_members,verified_joins,total_budget,spent,status FROM campaigns WHERE advertiser_id=$1 ORDER BY campaign_id DESC LIMIT 20",message.from_user.id)
+    await message.answer("\n\n".join(f"#{r['campaign_id']} {r['title']}\n{r['status']} {r['verified_joins']}/{r['target_members']}\nSpent {r['spent']}/{r['total_budget']} USDT" for r in rows) or "No campaigns.")
 
 
 @dp.message(Command("campaigns"))
-async def admin_campaigns(message: Message):
-    if not await is_admin(message.from_user.id):
-        return
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch("""
-            SELECT campaign_id, advertiser_id, title, channel_link, target_members,
-                   reward_per_join, total_budget, verified_joins, status
-            FROM campaigns WHERE status IN ('pending_payment', 'pending_review', 'active')
-            ORDER BY campaign_id DESC LIMIT 20
-        """)
-    if not rows:
-        await message.answer("No campaigns awaiting review.")
-        return
-    out = "📢 CAMPAIGNS\n\n"
-    for r in rows:
-        out += f"#{r['campaign_id']} | Advertiser: {r['advertiser_id']}\n{r['title']}\n{r['channel_link']}\nTarget: {r['target_members']} | Joined: {r['verified_joins']}\nReward: {r['reward_per_join']} USDT | Budget: {r['total_budget']}\nStatus: {r['status']}\nApprove: /approvecampaign {r['campaign_id']}\nReject: /rejectcampaign {r['campaign_id']}\n\n"
-    await message.answer(out)
+async def campaigns(message: Message):
+    if not await is_admin(message.from_user.id): return
+    async with db_pool.acquire() as c:
+        rows=await c.fetch("SELECT campaign_id,advertiser_id,title,channel_link,target_members,verified_joins,reward_per_join,total_budget,status FROM campaigns WHERE status IN ('pending_payment','pending_review','active') ORDER BY campaign_id DESC LIMIT 25")
+    await message.answer("\n\n".join(f"#{r['campaign_id']} user {r['advertiser_id']} {r['title']}\n{r['channel_link']}\n{r['verified_joins']}/{r['target_members']} reward {r['reward_per_join']} budget {r['total_budget']} status {r['status']}\n/approvecampaign {r['campaign_id']} | /rejectcampaign {r['campaign_id']}" for r in rows) or "No campaigns.")
 
 
 @dp.message(Command("approvecampaign"))
 async def approve_campaign(message: Message):
-    if not await is_admin(message.from_user.id):
-        return
+    if not await is_admin(message.from_user.id): return
     try:
-        cid = int(message.text.split()[1])
-        async with db_pool.acquire() as conn:
-            row = await conn.fetchrow("""
-                UPDATE campaigns SET status = 'active', updated_at = NOW()
-                WHERE campaign_id = $1 AND status = 'pending_payment'
-                RETURNING advertiser_id, title
-            """, cid)
-        if not row:
-            await message.answer("Pending campaign not found.")
-            return
-        await message.answer(f"✅ Campaign #{cid} approved and active.")
-        try:
-            await bot.send_message(row["advertiser_id"], f"Your campaign #{cid} ({row['title']}) is approved. Note: join verification must be performed by an admin until bot membership checking is configured.")
-        except Exception:
-            pass
-    except (ValueError, IndexError):
-        await message.answer("Use: /approvecampaign ID")
+        cid=int(message.text.split()[1])
+        async with db_pool.acquire() as c:
+            r=await c.fetchrow("UPDATE campaigns SET status='active',updated_at=NOW() WHERE campaign_id=$1 AND status='pending_payment' AND is_test=FALSE RETURNING advertiser_id,title",cid)
+        await message.answer("Campaign approved and active." if r else "Pending campaign not found.")
+        if r:
+            try: await bot.send_message(r["advertiser_id"],f"Campaign #{cid} ({r['title']}) approved.")
+            except Exception: pass
+    except (ValueError,IndexError): await message.answer("Use: /approvecampaign ID")
 
 
 @dp.message(Command("rejectcampaign"))
 async def reject_campaign(message: Message):
-    if not await is_admin(message.from_user.id):
-        return
+    if not await is_admin(message.from_user.id): return
     try:
-        cid = int(message.text.split()[1])
-        async with db_pool.acquire() as conn:
-            async with conn.transaction():
-                row = await conn.fetchrow("""
-                    UPDATE campaigns SET status = 'rejected', updated_at = NOW()
-                    WHERE campaign_id = $1 AND status IN ('pending_payment', 'pending_review')
-                    RETURNING advertiser_id, total_budget
-                """, cid)
-                if row:
-                    await conn.execute("""
-                        UPDATE advertiser_wallets
-                        SET available = available + $1,
-                            reserved = GREATEST(reserved - $1, 0),
-                            updated_at = NOW()
-                        WHERE user_id = $2
-                    """, row["total_budget"], row["advertiser_id"])
-        if not row:
-            await message.answer("Campaign not found.")
-            return
-        await message.answer(f"❌ Campaign #{cid} rejected. Reserved budget refunded.")
-        try:
-            await bot.send_message(row["advertiser_id"], f"Your campaign #{cid} was rejected. Reserved budget was returned to your available wallet.")
-        except Exception:
-            pass
-    except (ValueError, IndexError):
-        await message.answer("Use: /rejectcampaign ID")
-
+        cid=int(message.text.split()[1])
+        async with db_pool.acquire() as c:
+            async with c.transaction():
+                r=await c.fetchrow("SELECT advertiser_id,total_budget,budget_reserved FROM campaigns WHERE campaign_id=$1 AND status IN ('pending_payment','pending_review') FOR UPDATE",cid)
+                if r:
+                    await c.execute("UPDATE campaigns SET status='rejected',budget_reserved=FALSE,updated_at=NOW() WHERE campaign_id=$1",cid)
+                    if r["budget_reserved"]:
+                        w=await c.fetchrow("SELECT reserved FROM advertiser_wallets WHERE user_id=$1 FOR UPDATE",r["advertiser_id"])
+                        if not w or w["reserved"]<r["total_budget"]:
+                            raise RuntimeError("Reserved wallet balance mismatch; manual reconciliation required")
+                        await c.execute("UPDATE advertiser_wallets SET available=available+$1,reserved=reserved-$1,updated_at=NOW() WHERE user_id=$2",r["total_budget"],r["advertiser_id"])
+        await message.answer("Campaign rejected and budget refunded." if r else "Campaign not found.")
+    except (ValueError,IndexError): await message.answer("Use: /rejectcampaign ID")
+    except Exception as e: print("Reject campaign error:",repr(e)); await message.answer("Refund stopped due to a wallet accounting mismatch. Contact support.")
 
 
 @dp.message(Command("joincampaign"))
 async def join_campaign(message: Message):
-    if not await allowed(message):
-        return
-
+    if not await allowed(message): return
     try:
-        cid = int(message.text.split()[1])
-        uid = message.from_user.id
-
-        async with db_pool.acquire() as conn:
-            campaign = await conn.fetchrow("""
-                SELECT campaign_id, title, channel_link, chat_id,
-                       target_members, verified_joins
-                FROM campaigns
-                WHERE campaign_id = $1 AND status = 'active'
-            """, cid)
-
-            if not campaign:
-                await message.answer("Campaign not found or not active.")
-                return
-
-            if campaign["verified_joins"] >= campaign["target_members"]:
-                await message.answer("Campaign target already reached.")
-                return
-
-            if not campaign["chat_id"]:
-                await message.answer("Campaign verification is not configured.")
-                return
-
-            await conn.execute("""
-                INSERT INTO campaign_joins (campaign_id, user_id)
-                VALUES ($1, $2)
-                ON CONFLICT (campaign_id, user_id) DO NOTHING
-            """, cid, uid)
-
-            join_status = await conn.fetchval("""
-                SELECT status FROM campaign_joins
-                WHERE campaign_id = $1 AND user_id = $2
-            """, cid, uid)
-
-        if join_status == "approved":
-            await message.answer("You have already received your reward.")
-            return
-
-        if join_status == "rejected":
-            await message.answer("Your previous join request was rejected.")
-            return
-
-        await message.answer(
-            f"📢 Campaign: {campaign['title']}\n\n"
-            f"Join Channel:\n{campaign['channel_link']}\n\n"
-            f"After joining, send:\n"
-            f"/verifycampaign {cid}\n\n"
-            "The bot will check your membership automatically."
-        )
-
-    except (ValueError, IndexError):
-        await message.answer("Use: /joincampaign CAMPAIGN_ID")
+        cid=int(message.text.split()[1]); uid=message.from_user.id
+        async with db_pool.acquire() as c:
+            camp=await c.fetchrow("SELECT campaign_id,title,channel_link,chat_id,target_members,verified_joins FROM campaigns WHERE campaign_id=$1 AND status='active'",cid)
+            if not camp: await message.answer("Campaign not found or inactive."); return
+            if camp["verified_joins"]>=camp["target_members"]: await message.answer("Campaign target reached."); return
+            await c.execute("INSERT INTO campaign_joins(campaign_id,user_id) VALUES($1,$2) ON CONFLICT DO NOTHING",cid,uid)
+            status=await c.fetchval("SELECT status FROM campaign_joins WHERE campaign_id=$1 AND user_id=$2",cid,uid)
+        if status=="approved": await message.answer("Already verified."); return
+        if status=="rejected": await message.answer("Previous request rejected."); return
+        await message.answer(f"{camp['title']}\nJoin: {camp['channel_link']}\nThen use /verifycampaign {cid}")
+    except (ValueError,IndexError): await message.answer("Use: /joincampaign ID")
 
 
 @dp.message(Command("verifycampaign"))
 async def verify_campaign(message: Message):
-    if not await allowed(message):
-        return
-
+    if not await allowed(message): return
     try:
-        cid = int(message.text.split()[1])
-        uid = message.from_user.id
+        cid=int(message.text.split()[1]); uid=message.from_user.id
+        async with db_pool.acquire() as c:
+            camp=await c.fetchrow("SELECT chat_id FROM campaigns WHERE campaign_id=$1 AND status='active'",cid)
+            join=await c.fetchrow("SELECT status FROM campaign_joins WHERE campaign_id=$1 AND user_id=$2",cid,uid)
+        if not camp or not join: await message.answer("Campaign/join request not found."); return
+        if join["status"]=="approved": await message.answer("Already rewarded."); return
+        if join["status"]!="pending": await message.answer("Join request is not pending."); return
+        try:
+            member=await bot.get_chat_member(camp["chat_id"],uid)
+            is_member=member.status in ("member","administrator","creator") or (member.status=="restricted" and getattr(member,"is_member",False))
+        except Exception as e:
+            print("Membership API error:",repr(e)); await message.answer("Could not check membership; try again later."); return
+        if not is_member: await message.answer("Join the channel first, then retry."); return
 
-        points_per_usdt = Decimal(
-            str(await get_setting("points_per_usdt", "1000"))
-        )
-
-        async with db_pool.acquire() as conn:
-            async with conn.transaction():
-
-                campaign = await conn.fetchrow("""
-                    SELECT * FROM campaigns
-                    WHERE campaign_id = $1 AND status = 'active'
-                    FOR UPDATE
-                """, cid)
-
-                if not campaign:
-                    await message.answer("Campaign not found or no longer active.")
-                    return
-
-                join = await conn.fetchrow("""
-                    SELECT * FROM campaign_joins
-                    WHERE campaign_id = $1 AND user_id = $2
-                    FOR UPDATE
-                """, cid, uid)
-
-                if not join:
-                    await message.answer("First use /joincampaign ID.")
-                    return
-
-                if join["status"] == "approved":
-                    await message.answer("You have already received your reward.")
-                    return
-
-                if join["status"] != "pending":
-                    await message.answer("Your join request is not pending.")
-                    return
-
-                if campaign["verified_joins"] >= campaign["target_members"]:
-                    await message.answer("Campaign target already reached.")
-                    return
-
-                if not campaign["chat_id"]:
-                    await message.answer("Channel ID is missing.")
-                    return
-
-                # Check actual Telegram membership
-                try:
-                    member = await bot.get_chat_member(
-                        chat_id=campaign["chat_id"],
-                        user_id=uid
-                    )
-
-                    is_member = (
-                        member.status in ("member", "administrator", "creator")
-                        or (
-                            member.status == "restricted"
-                            and getattr(member, "is_member", False)
-                        )
-                    )
-
-                except Exception as e:
-                    print(f"Membership check error: {e}")
-                    await message.answer(
-                        "Could not check membership. Please try again later."
-                    )
-                    return
-
-                if not is_member:
-                    await message.answer(
-                        "❌ You are not a member of this channel yet.\n"
-                        "Join the channel first, then try again."
-                    )
-                    return
-
-                reward = campaign["reward_per_join"]
-                new_spent = campaign["spent"] + reward
-
-                if new_spent > campaign["total_budget"]:
-                    await message.answer("Campaign budget exhausted.")
-                    return
-
-                points = int(
-                    (reward * points_per_usdt).to_integral_value()
-                )
-
-                await conn.execute("""
-                    UPDATE campaign_joins
-                    SET status = 'approved'
-                    WHERE join_id = $1
-                """, join["join_id"])
-
-                await conn.execute("""
-                    UPDATE campaigns
-                    SET verified_joins = verified_joins + 1,
-                        spent = spent + $1,
-                        updated_at = NOW()
-                    WHERE campaign_id = $2
-                """, reward, cid)
-
-                await conn.execute("""
-                    UPDATE advertiser_wallets
-                    SET reserved = GREATEST(reserved - $1, 0),
-                        updated_at = NOW()
-                    WHERE user_id = $2
-                """, reward, campaign["advertiser_id"])
-
-                await conn.execute("""
-                    UPDATE users
-                    SET points = points + $1
-                    WHERE user_id = $2
-                """, points, uid)
-
-                if campaign["verified_joins"] + 1 >= campaign["target_members"]:
-                    remaining = campaign["total_budget"] - new_spent
-
-                    await conn.execute("""
-                        UPDATE campaigns
-                        SET status = 'completed',
-                            updated_at = NOW()
-                        WHERE campaign_id = $1
-                    """, cid)
-
-                    if remaining > 0:
-                        await conn.execute("""
-                            UPDATE advertiser_wallets
-                            SET available = available + $1,
-                                reserved = GREATEST(reserved - $1, 0),
-                                updated_at = NOW()
-                            WHERE user_id = $2
-                        """, remaining, campaign["advertiser_id"])
-
-        await message.answer(
-            f"✅ Membership verified!\n"
-            f"🎁 Reward: +{points} Points\n"
-            f"Campaign: #{cid}"
-        )
-
-    except (ValueError, IndexError):
-        await message.answer("Use: /verifycampaign CAMPAIGN_ID")
-    except Exception as e:
-        print(f"Campaign verification error: {e}")
-        await message.answer("Verification failed. Please try again later.")
+        async with db_pool.acquire() as c:
+            async with c.transaction():
+                campaign=await c.fetchrow("SELECT * FROM campaigns WHERE campaign_id=$1 AND status='active' FOR UPDATE",cid)
+                j=await c.fetchrow("SELECT * FROM campaign_joins WHERE campaign_id=$1 AND user_id=$2 FOR UPDATE",cid,uid)
+                if not campaign or not j or j["status"]!="pending": await message.answer("Request already processed."); return
+                if campaign["verified_joins"]>=campaign["target_members"]: await message.answer("Campaign target reached."); return
+                reward=campaign["reward_per_join"]
+                spent=campaign["spent"]+reward
+                if spent>campaign["total_budget"]: await message.answer("Campaign budget exhausted."); return
+                points=0 if campaign["is_test"] else int((reward*POINTS_PER_USDT).to_integral_value(rounding=ROUND_DOWN))
+                if not campaign["is_test"] and points<1: await message.answer("Campaign reward is too small to convert to points."); return
+                if not campaign["is_test"]:
+                    w=await c.fetchrow("SELECT reserved FROM advertiser_wallets WHERE user_id=$1 FOR UPDATE",campaign["advertiser_id"])
+                    if not w or w["reserved"]<reward: raise RuntimeError("Reserved wallet balance mismatch")
+                await c.execute("UPDATE campaign_joins SET status='approved' WHERE join_id=$1",j["join_id"])
+                await c.execute("UPDATE campaigns SET verified_joins=verified_joins+1,spent=spent+$1,updated_at=NOW() WHERE campaign_id=$2",reward,cid)
+                if not campaign["is_test"]:
+                    await c.execute("UPDATE advertiser_wallets SET reserved=reserved-$1,updated_at=NOW() WHERE user_id=$2",reward,campaign["advertiser_id"])
+                    await c.execute("UPDATE users SET points=points+$1 WHERE user_id=$2",points,uid)
+                if campaign["verified_joins"]+1>=campaign["target_members"]:
+                    remaining=campaign["total_budget"]-spent
+                    await c.execute("UPDATE campaigns SET status='completed',budget_reserved=FALSE,updated_at=NOW() WHERE campaign_id=$1",cid)
+                    if not campaign["is_test"] and campaign["budget_reserved"] and remaining>0:
+                        w=await c.fetchrow("SELECT reserved FROM advertiser_wallets WHERE user_id=$1 FOR UPDATE",campaign["advertiser_id"])
+                        if not w or w["reserved"]<remaining: raise RuntimeError("Reserved balance mismatch on campaign completion")
+                        await c.execute("UPDATE advertiser_wallets SET available=available+$1,reserved=reserved-$1,updated_at=NOW() WHERE user_id=$2",remaining,campaign["advertiser_id"])
+        await message.answer("✅ Test membership verified; no points awarded." if campaign["is_test"] else f"✅ Membership verified! +{points} points. Campaign #{cid}")
+    except (ValueError,IndexError): await message.answer("Use: /verifycampaign ID")
+    except Exception as e: print("Campaign verify error:",repr(e)); await message.answer("Verification failed safely. Please contact admin.")
 
 
 @dp.message(Command("setpointsrate"))
 async def set_points_rate(message: Message):
-    if not await is_admin(message.from_user.id):
-        return
+    if not await is_admin(message.from_user.id): return
     try:
-        rate = Decimal(message.text.split()[1])
-        if rate <= 0:
-            raise ValueError
-        await set_setting("points_per_usdt", str(rate))
-        await message.answer(f"✅ Campaign reward conversion set: 1 USDT = {rate} points.")
-    except (ValueError, IndexError, InvalidOperation):
-        await message.answer("Use: /setpointsrate POINTS_PER_USDT")
+        rate=Decimal(message.text.split()[1])
+        if rate!=POINTS_PER_USDT: raise ValueError
+        await set_setting("points_per_usdt","1000")
+        await message.answer("Rate fixed at 1,000 points = 1 USDT.")
+    except (ValueError,IndexError,InvalidOperation): await message.answer("This version fixes the conversion at 1,000 points = 1 USDT.")
 
 
-# ---------------- USER MENU ----------------
-
-@dp.message(lambda m: m.text == "🎬 Watch Ads")
+# MENU
+@dp.message(lambda m:m.text=="🎬 Watch Ads")
 async def watch_ads(message: Message):
-    if not await allowed(message):
-        return
-    uid = message.from_user.id
-    reward = await get_setting("ad_reward", REWARD_POINTS)
-    async with db_pool.acquire() as conn:
-        result = await conn.fetchrow("""
-            UPDATE users SET points = points + $2, last_ad_at = NOW()
-            WHERE user_id = $1 AND (
-                last_ad_at IS NULL OR last_ad_at <= NOW() - INTERVAL '30 seconds'
-            ) RETURNING points
-        """, uid, reward)
-        if result:
-            await message.answer(
-                f"🎁 TEST MODE: +{reward} points added.\nBalance: {result['points']} points\n\n"
-                "Real rewarded ads are not connected yet. Do not treat this as ad revenue."
-            )
-            return
-        last = await conn.fetchval("SELECT last_ad_at FROM users WHERE user_id = $1", uid)
-    remaining = max(1, math.ceil((last + timedelta(seconds=COOLDOWN_SECONDS) - datetime.now(timezone.utc)).total_seconds()))
-    await message.answer(f"⏳ Please wait {remaining}s before trying again.")
+    if not await allowed(message): return
+    # No real rewarded-ad provider is integrated. Do not create withdrawable liabilities.
+    await message.answer("Real rewarded ads are not connected yet. No points were added. This feature will activate after an ad provider is integrated.")
 
 
-@dp.message(lambda m: m.text == "💰 Balance")
+@dp.message(lambda m:m.text=="💰 Balance")
 async def balance(message: Message):
-    if not await allowed(message):
-        return
-    user = await get_user(message.from_user.id)
-    await message.answer(f"💰 Your current balance: {user['points']} points")
+    if not await allowed(message): return
+    u=await get_user(message.from_user.id)
+    await message.answer(f"Your balance: {u['points']} points (${u['points']/1000:.3f} equivalent; minimum withdrawal 5,000 points).")
 
 
-@dp.message(lambda m: m.text == "📋 Tasks")
+@dp.message(lambda m:m.text=="📋 Tasks")
 async def tasks(message: Message):
-    if not await allowed(message):
-        return
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch("SELECT task_id, title, reward FROM tasks WHERE active = TRUE ORDER BY task_id DESC")
-    if not rows:
-        await message.answer("No tasks available right now.")
-        return
-    out = "📋 AVAILABLE TASKS\n\n"
-    for r in rows:
-        out += f"ID: {r['task_id']}\n{r['title']}\nReward: {r['reward']} points\n\n"
-    out += "Submit proof using:\n/submit TASK_ID YOUR_PROOF\n\n"
-    async with db_pool.acquire() as conn:
-        campaigns = await conn.fetch("""
-            SELECT campaign_id, title, channel_link, target_members, verified_joins, reward_per_join
-            FROM campaigns WHERE status = 'active' AND verified_joins < target_members
-            ORDER BY campaign_id DESC LIMIT 15
-        """)
-    if campaigns:
-        out += "📢 PAID PROMOTION TASKS\n\n"
-        for c in campaigns:
-            out += (f"Campaign #{c['campaign_id']}: {c['title']}\n"
-                    f"Progress: {c['verified_joins']}/{c['target_members']}\n"
-                    f"Reward: {c['reward_per_join']} USDT equivalent\n"
-                    f"Join: /joincampaign {c['campaign_id']}\n\n")
-    await message.answer(out)
+    if not await allowed(message): return
+    async with db_pool.acquire() as c:
+        rows=await c.fetch("SELECT task_id,title,reward FROM tasks WHERE active=TRUE ORDER BY task_id DESC")
+        camps=await c.fetch("SELECT campaign_id,title,target_members,verified_joins,reward_per_join,is_test FROM campaigns WHERE status='active' AND verified_joins<target_members ORDER BY campaign_id DESC LIMIT 15")
+    out="📋 AVAILABLE TASKS\n\n"+"\n\n".join(f"#{r['task_id']} {r['title']}\nReward: {r['reward']} points\n/submit {r['task_id']} YOUR_PROOF" for r in rows)
+    if camps:
+        out+="\n\n📢 CAMPAIGNS\n"+"\n\n".join(f"#{r['campaign_id']} {r['title']} {r['verified_joins']}/{r['target_members']}\nReward: {'TEST - no points' if r['is_test'] else str(r['reward_per_join'])+' USDT equivalent'}\n/joincampaign {r['campaign_id']}" for r in camps)
+    await message.answer(out if rows or camps else "No tasks available.")
 
 
-@dp.message(lambda m: m.text == "💳 Withdraw")
+@dp.message(lambda m:m.text=="💳 Withdraw")
 async def withdraw_menu(message: Message):
-    if not await allowed(message):
-        return
-    minimum = await get_setting("min_withdraw", MIN_WITHDRAWAL)
-    await message.answer(f"💳 Minimum withdrawal: {minimum} points\n\n/withdraw AMOUNT YOUR_CRYPTO_WALLET")
+    if await allowed(message):
+        await message.answer(f"Minimum: {await get_setting('min_withdraw',MIN_WITHDRAWAL)} points ($5).\nUse /withdraw AMOUNT TRC20|BEP20 WALLET_ADDRESS\nHistory: /mywithdrawals")
 
 
 @dp.message()
 async def fallback(message: Message):
-    await message.answer("Please use the menu buttons below. 👇", reply_markup=keyboard)
+    await message.answer("Please use the menu buttons below. 👇",reply_markup=keyboard)
 
 
-# ---------------- WEB SERVER ----------------
-
-async def health_handler(request: web.Request):
+async def health_handler(request):
     return web.Response(text="EarnWave bot is running")
 
 
 async def start_web_server():
-    app = web.Application()
-    app.router.add_get("/", health_handler)
-    app.router.add_get("/health", health_handler)
-    runner = web.AppRunner(app)
+    app=web.Application()
+    app.router.add_get("/",health_handler)
+    app.router.add_get("/health",health_handler)
+    runner=web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
+    await web.TCPSite(runner,"0.0.0.0",PORT).start()
     return runner
 
 
 async def main():
     await setup_database()
-    runner = await start_web_server()
+    runner=await start_web_server()
     try:
         await dp.start_polling(bot)
     finally:
@@ -2168,5 +1087,5 @@ async def main():
         await runner.cleanup()
 
 
-if __name__ == "__main__":
+if __name__=="__main__":
     asyncio.run(main())
