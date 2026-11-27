@@ -867,7 +867,6 @@ async def pending_withdrawals(message: Message):
 
 
 
-
 @dp.message(Command("approvewithdraw"))
 async def approve_withdrawal(message: Message):
     if not await is_admin(message.from_user.id):
