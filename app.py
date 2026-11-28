@@ -342,28 +342,127 @@ async def admin_action(request):
 
 
 async def admin_deposit_action(request):
-    await require_admin(request); data=await body_json(request)
-    try: tid=int(data.get("id"))
-    except Exception: raise web.HTTPBadRequest(text="Invalid deposit ID")
-    async with core.db_pool.acquire() as c:
-        row=await c.fetchrow("SELECT * FROM advertiser_transactions WHERE tx_id=$1 AND tx_type='deposit' AND status='pending'",tid)
-    if not row: raise web.HTTPNotFound(text="Pending deposit not found")
-    if data.get("action")=="reject":
-        async with core.db_pool.acquire() as c: await c.execute("UPDATE advertiser_transactions SET status='rejected' WHERE tx_id=$1 AND status='pending'",tid)
-        return json_response({"ok":True,"message":"Deposit rejected."})
+    await require_admin(request)
+    data = await body_json(request)
+
+    action = data.get("action")
+
+    if action not in ("approve", "reject"):
+        raise web.HTTPBadRequest(text="Invalid action")
+
     try:
-        verified=await core.verify_deposit_on_blockchain(row["network"],row["reference"],row["amount"])
+        tid = int(data.get("id"))
+    except (TypeError, ValueError):
+        raise web.HTTPBadRequest(text="Invalid deposit ID")
+
+    async with core.db_pool.acquire() as c:
+        row = await c.fetchrow(
+            """
+            SELECT *
+            FROM advertiser_transactions
+            WHERE tx_id = $1
+              AND tx_type = 'deposit'
+              AND status = 'pending'
+            """,
+            tid
+        )
+
+    if not row:
+        raise web.HTTPNotFound(text="Pending deposit not found")
+
+    # Reject deposit
+    if action == "reject":
+        async with core.db_pool.acquire() as c:
+            result = await c.execute(
+                """
+                UPDATE advertiser_transactions
+                SET status = 'rejected'
+                WHERE tx_id = $1
+                  AND tx_type = 'deposit'
+                  AND status = 'pending'
+                """,
+                tid
+            )
+
+        if result != "UPDATE 1":
+            raise web.HTTPConflict(text="Deposit already processed")
+
+        return json_response({
+            "ok": True,
+            "message": "Deposit rejected."
+        })
+
+    # Verify deposit on blockchain before approval
+    try:
+        verified = await core.verify_deposit_on_blockchain(
+            row["network"],
+            row["reference"],
+            row["amount"]
+        )
+
     except Exception as e:
-        print("Mini App deposit verification error:",repr(e)); raise web.HTTPBadGateway(text="Blockchain verification unavailable; no funds credited")
-    if not verified: raise web.HTTPBadRequest(text="Blockchain verification failed; no funds credited")
+        print("Mini App deposit verification error:", repr(e))
+        raise web.HTTPBadGateway(
+            text="Blockchain verification unavailable; no funds credited"
+        )
+
+    if not verified:
+        raise web.HTTPBadRequest(
+            text="Blockchain verification failed; no funds credited"
+        )
+
+    # Approve and credit atomically
     async with core.db_pool.acquire() as c:
         async with c.transaction():
-            await c.execute("SELECT pg_advisory_xact_lock(hashtext($1))",row["reference"].lower())
-            current=await c.fetchrow("SELECT * FROM advertiser_transactions WHERE tx_id=$1 AND status='pending' FOR UPDATE",tid)
-            if not current: raise web.HTTPConflict(text="Deposit already processed")
-            await c.execute("UPDATE advertiser_transactions SET status='approved' WHERE tx_id=$1",tid)
-            await c.execute("INSERT INTO advertiser_wallets(user_id,available) VALUES($1,$2) ON CONFLICT(user_id) DO UPDATE SET available=advertiser_wallets.available+EXCLUDED.available,updated_at=NOW()",row["user_id"],row["amount"])
-    return json_response({"ok":True,"message":f"Verified and credited {row['amount']} USDT."})
+
+            await c.execute(
+                "SELECT pg_advisory_xact_lock(hashtext($1))",
+                row["reference"].lower()
+            )
+
+            current = await c.fetchrow(
+                """
+                SELECT *
+                FROM advertiser_transactions
+                WHERE tx_id = $1
+                  AND tx_type = 'deposit'
+                  AND status = 'pending'
+                FOR UPDATE
+                """,
+                tid
+            )
+
+            if not current:
+                raise web.HTTPConflict(
+                    text="Deposit already processed"
+                )
+
+            await c.execute(
+                """
+                UPDATE advertiser_transactions
+                SET status = 'approved'
+                WHERE tx_id = $1
+                """,
+                tid
+            )
+
+            await c.execute(
+                """
+                INSERT INTO advertiser_wallets (user_id, available)
+                VALUES ($1, $2)
+                ON CONFLICT (user_id)
+                DO UPDATE SET
+                    available = advertiser_wallets.available + EXCLUDED.available,
+                    updated_at = NOW()
+                """,
+                current["user_id"],
+                current["amount"]
+            )
+
+    return json_response({
+        "ok": True,
+        "message": f"Verified and credited {row['amount']} USDT."
+    })
 
 
 async def admin_advwithdraw_action(request):
