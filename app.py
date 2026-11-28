@@ -301,6 +301,8 @@ async def admin_list(request):
     return json_response({"items":result})
 
 async def admin_action(request):
+    if data.get("action") not in ("approve", "reject"):
+    raise web.HTTPBadRequest(text="Invalid action")
     await require_admin(request); data=await body_json(request); action=request.match_info["action"]
     try: item_id=int(data.get("id"))
     except Exception: raise web.HTTPBadRequest(text="Invalid ID")
